@@ -2,11 +2,21 @@
 set -e
 
 # zerobrew installer
-# Usage: curl -sSL https://raw.githubusercontent.com/lucasgelfond/zerobrew/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/hanthor/zerobrew/installer/linux/install.sh | bash
 
 ZEROBREW_REPO="https://github.com/hanthor/zerobrew.git"
-: ${ZEROBREW_DIR:=$HOME/.zerobrew}
+: ${ZEROBREW_DIR:=$HOME/.zerobrew/src} # Repo location
 : ${ZEROBREW_BIN:=$HOME/.local/bin}
+
+# Detect OS and set default root
+OS="$(uname)"
+if [[ "$OS" == "Linux" ]]; then
+    ZEROBREW_DEFAULT_ROOT="$HOME/.zerobrew"
+else
+    ZEROBREW_DEFAULT_ROOT="/opt/zerobrew"
+fi
+: ${ZEROBREW_ROOT:=$ZEROBREW_DEFAULT_ROOT}
+: ${ZEROBREW_PREFIX:=$ZEROBREW_ROOT}
 
 echo "Installing zerobrew..."
 
@@ -75,11 +85,12 @@ if [[ ! -w $SHELL_CONFIG ]]; then
 fi
 
 # Add to PATH in shell config if not already there
-PATHS_TO_ADD=("$ZEROBREW_BIN" "/opt/zerobrew/prefix/bin")
+PATHS_TO_ADD=("$ZEROBREW_BIN" "$ZEROBREW_PREFIX/bin")
 if ! grep -q "^# zerobrew$" "$SHELL_CONFIG" 2>/dev/null; then
     cat >>"$SHELL_CONFIG" <<EOF
 # zerobrew
-export ZEROBREW_DIR=$ZEROBREW_DIR
+export ZEROBREW_ROOT=$ZEROBREW_ROOT
+export ZEROBREW_PREFIX=$ZEROBREW_PREFIX
 export ZEROBREW_BIN=$ZEROBREW_BIN
 _zb_path_append() {
     local argpath="\$1"
@@ -98,18 +109,28 @@ EOF
 fi
 
 # Export for current session so zb init works
-export PATH="$ZEROBREW_BIN:/opt/zerobrew/prefix/bin:$PATH"
+export ZEROBREW_ROOT=$ZEROBREW_ROOT
+export ZEROBREW_PREFIX=$ZEROBREW_PREFIX
+export PATH="$ZEROBREW_BIN:$ZEROBREW_PREFIX/bin:$PATH"
 
-# Set up /opt/zerobrew directories with correct ownership
+# Set up zerobrew directories with correct ownership
 echo ""
-echo "Setting up zerobrew directories..."
+echo "Setting up zerobrew directories at $ZEROBREW_ROOT..."
 CURRENT_USER=$(whoami)
-if [[ ! -d "/opt/zerobrew" ]] || [[ ! -w "/opt/zerobrew" ]]; then
-    echo "Creating /opt/zerobrew (requires sudo)..."
-    sudo mkdir -p /opt/zerobrew/store /opt/zerobrew/db /opt/zerobrew/cache /opt/zerobrew/locks
-    sudo mkdir -p /opt/zerobrew/prefix/bin /opt/zerobrew/prefix/Cellar
-    sudo chown -R "$CURRENT_USER" /opt/zerobrew
-    sudo chown -R "$CURRENT_USER" /opt/zerobrew/prefix
+if [[ ! -d "$ZEROBREW_ROOT" ]] || [[ ! -w "$ZEROBREW_ROOT" ]]; then
+    if [[ "$ZEROBREW_ROOT" == "/opt/zerobrew"* ]]; then
+        echo "Creating $ZEROBREW_ROOT (requires sudo)..."
+        sudo mkdir -p "$ZEROBREW_ROOT/store" "$ZEROBREW_ROOT/db" "$ZEROBREW_ROOT/cache" "$ZEROBREW_ROOT/locks"
+        sudo mkdir -p "$ZEROBREW_PREFIX/bin" "$ZEROBREW_PREFIX/Cellar"
+        sudo chown -R "$CURRENT_USER" "$ZEROBREW_ROOT"
+        if [[ "$ZEROBREW_ROOT" != "$ZEROBREW_PREFIX" ]]; then
+            sudo chown -R "$CURRENT_USER" "$ZEROBREW_PREFIX"
+        fi
+    else
+        echo "Creating $ZEROBREW_ROOT..."
+        mkdir -p "$ZEROBREW_ROOT/store" "$ZEROBREW_ROOT/db" "$ZEROBREW_ROOT/cache" "$ZEROBREW_ROOT/locks"
+        mkdir -p "$ZEROBREW_PREFIX/bin" "$ZEROBREW_PREFIX/Cellar"
+    fi
 fi
 
 # Run zb init to finalize setup
@@ -124,7 +145,7 @@ echo "============================================"
 echo ""
 echo "Run this to start using zerobrew now:"
 echo ""
-echo "    export PATH=\"$ZEROBREW_BIN:/opt/zerobrew/prefix/bin:\$PATH\""
+echo "    export PATH=\"$ZEROBREW_BIN:$ZEROBREW_PREFIX/bin:\$PATH\""
 echo ""
 echo "Or restart your terminal, to source updated ${SHELL_CONFIG}."
 echo ""
