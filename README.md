@@ -10,7 +10,7 @@
 ## Install
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/lucasgelfond/zerobrew/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/hanthor/zerobrew/installer/linux/install.sh | bash
 ```
 
 After install, run the export command it prints, or restart your terminal.
