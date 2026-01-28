@@ -5,6 +5,7 @@ set -e
 # Usage: curl -sSL https://raw.githubusercontent.com/hanthor/zerobrew/installer/linux/install.sh | bash
 
 ZEROBREW_REPO="https://github.com/hanthor/zerobrew.git"
+ZEROBREW_BRANCH="linux-support"
 : ${ZEROBREW_DIR:=$HOME/.zerobrew/src} # Repo location
 : ${ZEROBREW_BIN:=$HOME/.local/bin}
 
@@ -39,11 +40,11 @@ echo "Rust version: $(rustc --version)"
 if [[ -d "$ZEROBREW_DIR" ]]; then
     echo "Updating zerobrew..."
     cd "$ZEROBREW_DIR"
-    git fetch origin linux-support
-    git reset --hard origin/linux-support
+    git fetch origin "$ZEROBREW_BRANCH"
+    git reset --hard "origin/$ZEROBREW_BRANCH"
 else
     echo "Cloning zerobrew..."
-    git clone --depth 1 -b linux-support "$ZEROBREW_REPO" "$ZEROBREW_DIR"
+    git clone --depth 1 -b "$ZEROBREW_BRANCH" "$ZEROBREW_REPO" "$ZEROBREW_DIR"
     cd "$ZEROBREW_DIR"
 fi
 
