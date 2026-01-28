@@ -4,7 +4,7 @@ set -e
 # zerobrew installer
 # Usage: curl -sSL https://raw.githubusercontent.com/lucasgelfond/zerobrew/main/install.sh | bash
 
-ZEROBREW_REPO="https://github.com/lucasgelfond/zerobrew.git"
+ZEROBREW_REPO="https://github.com/hanthor/zerobrew.git"
 : ${ZEROBREW_DIR:=$HOME/.zerobrew}
 : ${ZEROBREW_BIN:=$HOME/.local/bin}
 
@@ -29,11 +29,11 @@ echo "Rust version: $(rustc --version)"
 if [[ -d "$ZEROBREW_DIR" ]]; then
     echo "Updating zerobrew..."
     cd "$ZEROBREW_DIR"
-    git fetch --depth=1 origin main
-    git reset --hard origin/main
+    git fetch origin linux-support
+    git reset --hard origin/linux-support
 else
     echo "Cloning zerobrew..."
-    git clone --depth 1 "$ZEROBREW_REPO" "$ZEROBREW_DIR"
+    git clone --depth 1 -b linux-support "$ZEROBREW_REPO" "$ZEROBREW_DIR"
     cd "$ZEROBREW_DIR"
 fi
 
