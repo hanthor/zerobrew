@@ -265,6 +265,10 @@ fn interpolate(s: &str, ctx: &CaskContext) -> String {
     // We can infer simplified arch from our system arch string
     let simple_arch = if ctx.arch.contains("arm64") { "arm64" } else { "x64" };
     res = res.replace("#{arch}", simple_arch);
+    
+    // handle #{staged_path} - refers to the installation directory
+    // We replace with "." so that joining to the caskroom path works correctly (avoiding absolute path override)
+    res = res.replace("#{staged_path}", ".");
 
     res
 }
