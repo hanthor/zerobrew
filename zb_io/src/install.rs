@@ -422,6 +422,11 @@ impl Installer {
         Ok(removed)
     }
 
+    /// Ensure a tap is installed
+    pub fn tap(&self, user: &str, repo: &str) -> Result<PathBuf, Error> {
+        self.tap_manager.ensure_tap(user, repo)
+    }
+
     /// Check if a formula is installed
     pub fn is_installed(&self, name: &str) -> bool {
         self.db.get_installed(name).is_some()
@@ -484,14 +489,15 @@ impl Installer {
                  message: format!("Failed to remove existing caskroom dir: {}", e),
              })?;
         }
-        std::fs::create_dir_all(&caskroom).map_err(|e| Error::StoreCorruption {
-            message: format!("Failed to create caskroom: {}", e),
+        let caskroom_parent = caskroom.parent().unwrap();
+        std::fs::create_dir_all(caskroom_parent).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to create caskroom parent: {}", e),
         })?;
 
-        // Extract
-        // zb_io::extract::extract_tarball uses tar/flate2.
-        crate::extract::extract_tarball(&store_entry, &caskroom).map_err(|e| Error::StoreCorruption {
-            message: format!("Failed to extract cask: {}", e),
+        // Link store entry to caskroom
+        // We do not extract again, as ensure_entry (via downloader) provides the content
+        symlink(&store_entry, &caskroom).map_err(|e| Error::StoreCorruption {
+             message: format!("Failed to symlink store entry to caskroom: {}", e),
         })?;
 
         // Link binaries
