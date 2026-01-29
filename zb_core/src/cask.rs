@@ -131,14 +131,12 @@ fn visit_node(
 
             match method_name {
                 "version" => {
-                    if version_pass {
-                        if let Some(args) = node.child_by_field_name("arguments") {
-                            // Extract raw string or handle comma-separated values
-                            // For simplicity, just grab the first string literal or raw text
-                            // version "1.2.3,12345" -> "1.2.3,12345"
-                            let val = extract_string_arg(args, source, ctx)?;
-                            ctx.version = Some(val);
-                        }
+                    if version_pass && let Some(args) = node.child_by_field_name("arguments") {
+                        // Extract raw string or handle comma-separated values
+                        // For simplicity, just grab the first string literal or raw text
+                        // version "1.2.3,12345" -> "1.2.3,12345"
+                        let val = extract_string_arg(args, source, ctx)?;
+                        ctx.version = Some(val);
                     }
                 }
                 "sha256" | "url" | "name" | "homepage" | "desc" => {
@@ -150,19 +148,18 @@ fn visit_node(
                             } else if let Ok(val) = extract_string_arg(args, source, ctx) {
                                 // Fallback to positional arg if no arch match found (or if it's universal)
                                 if !ctx.variables.contains_key(method_name) {
-                                     ctx.variables.insert(method_name.to_string(), val);
+                                    ctx.variables.insert(method_name.to_string(), val);
                                 }
                             }
                         }
                     }
                 }
                 "binary" | "artifact" | "app" => {
-                    if !version_pass {
-                         if let Some(args) = node.child_by_field_name("arguments") {
-                             if let Ok(val) = extract_string_arg(args, source, ctx) {
-                                 ctx.artifacts.push((method_name.to_string(), val));
-                             }
-                         }
+                    if !version_pass
+                        && let Some(args) = node.child_by_field_name("arguments")
+                        && let Ok(val) = extract_string_arg(args, source, ctx)
+                    {
+                        ctx.artifacts.push((method_name.to_string(), val));
                     }
                 }
                 _ => {}
@@ -199,14 +196,12 @@ fn extract_string_arg(
         }
     }
     // Try bare word/number if strict string not found?
-    Err(CaskError::ParseError("Could not find string argument".to_string()))
+    Err(CaskError::ParseError(
+        "Could not find string argument".to_string(),
+    ))
 }
 
-fn extract_arch_specific_arg(
-    args_node: Node,
-    source: &str,
-    ctx: &CaskContext,
-) -> Option<String> {
+fn extract_arch_specific_arg(args_node: Node, source: &str, ctx: &CaskContext) -> Option<String> {
     let mut cursor = args_node.walk();
     for child in args_node.children(&mut cursor) {
         let kind = child.kind();
@@ -228,16 +223,15 @@ fn extract_arch_specific_arg(
 
 fn extract_pair_value(pair_node: Node, source: &str, ctx: &CaskContext) -> Option<String> {
     if let Some(key) = pair_node.child_by_field_name("key") {
-         let key_text = key.utf8_text(source.as_bytes()).unwrap_or("");
-         // println!("DEBUG: key_text: '{}', ctx.arch: '{}'", key_text, ctx.arch);
-         if key_text.trim_matches(':') == ctx.arch {
-             if let Some(val) = pair_node.child_by_field_name("value") {
-                 if val.kind() == "string" {
-                     let s = val.utf8_text(source.as_bytes()).unwrap().trim_matches('"');
-                     return Some(interpolate(s, ctx));
-                 }
-             }
-         }
+        let key_text = key.utf8_text(source.as_bytes()).unwrap_or("");
+        // println!("DEBUG: key_text: '{}', ctx.arch: '{}'", key_text, ctx.arch);
+        if key_text.trim_matches(':') == ctx.arch
+            && let Some(val) = pair_node.child_by_field_name("value")
+            && val.kind() == "string"
+        {
+            let s = val.utf8_text(source.as_bytes()).unwrap().trim_matches('"');
+            return Some(interpolate(s, ctx));
+        }
     }
     None
 }
@@ -251,21 +245,25 @@ fn interpolate(s: &str, ctx: &CaskContext) -> String {
         // handle #{version.csv.first} / #{version.csv.second}
         // "1.15.8,5724687216017408" -> first="1.15.8", second="5724687216017408"
         if ver.contains(',') {
-             let parts: Vec<&str> = ver.split(',').collect();
-             if !parts.is_empty() {
-                 res = res.replace("#{version.csv.first}", parts[0]);
-             }
-             if parts.len() > 1 {
-                 res = res.replace("#{version.csv.second}", parts[1]);
-             }
+            let parts: Vec<&str> = ver.split(',').collect();
+            if !parts.is_empty() {
+                res = res.replace("#{version.csv.first}", parts[0]);
+            }
+            if parts.len() > 1 {
+                res = res.replace("#{version.csv.second}", parts[1]);
+            }
         }
     }
     // handle #{arch} - somewhat ambiguous in casks, usually "arm" or "x64" for mac,
     // but antigravity-linux.rb uses "linux-#{arch}"
     // We can infer simplified arch from our system arch string
-    let simple_arch = if ctx.arch.contains("arm64") { "arm64" } else { "x64" };
+    let simple_arch = if ctx.arch.contains("arm64") {
+        "arm64"
+    } else {
+        "x64"
+    };
     res = res.replace("#{arch}", simple_arch);
-    
+
     // handle #{staged_path} - refers to the installation directory
     // We replace with "." so that joining to the caskroom path works correctly (avoiding absolute path override)
     res = res.replace("#{staged_path}", ".");

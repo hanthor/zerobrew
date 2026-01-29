@@ -8,10 +8,10 @@ build: fmt lint
 [script]
 install: build
     ZEROBREW_BIN="${ZEROBREW_BIN:-$HOME/.local/bin}"
-    ZEROBREW_OPT="${ZEROBREW_OPT:-/opt/zerobrew}"
+    ZEROBREW_ROOT="${ZEROBREW_ROOT:-/opt/zerobrew}"
 
-    if [[ -d "$ZEROBREW_OPT/prefix/lib/pkgconfig" ]]; then
-        export PKG_CONFIG_PATH="$ZEROBREW_OPT/prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    if [[ -d "$ZEROBREW_ROOT/prefix/lib/pkgconfig" ]]; then
+        export PKG_CONFIG_PATH="$ZEROBREW_ROOT/prefix/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     fi
     if [[ -d "/opt/homebrew/lib/pkgconfig" ]] && [[ ! "$PKG_CONFIG_PATH" =~ "/opt/homebrew/lib/pkgconfig" ]]; then
         export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -27,7 +27,7 @@ install: build
 uninstall:
     ZEROBREW_DIR="${ZEROBREW_DIR:-$HOME/.zerobrew}"
     ZEROBREW_BIN="${ZEROBREW_BIN:-$HOME/.local/bin}"
-    ZEROBREW_OPT="${ZEROBREW_OPT:-/opt/zerobrew}"
+    ZEROBREW_ROOT="${ZEROBREW_ROOT:-/opt/zerobrew}"
 
     ZEROBREW_INSTALLED_BIN="${ZEROBREW_BIN%/}/zb"
 
@@ -62,7 +62,7 @@ uninstall:
     echo -en "\x1b[1;31m"
     echo -e  "\t$ZEROBREW_INSTALLED_BIN"
     echo -e  "\t$ZEROBREW_DIR"
-    echo -e  "\t$ZEROBREW_OPT"
+    echo -e  "\t$ZEROBREW_ROOT"
     echo -en "\x1b[0m"
     read -rp "Continue? [y/N] " confirm
 
@@ -71,8 +71,8 @@ uninstall:
     [[ -f "$ZEROBREW_INSTALLED_BIN" ]] && rm -- "$ZEROBREW_INSTALLED_BIN"
     [[ -d "$ZEROBREW_DIR" ]] && rm -rf -- "$ZEROBREW_DIR"
 
-    if [[ -d "$ZEROBREW_OPT" ]]; then
-        $SUDO rm -r -- "$ZEROBREW_OPT"
+    if [[ -d "$ZEROBREW_ROOT" ]]; then
+        $SUDO rm -r -- "$ZEROBREW_ROOT"
     fi
 
 [script]
