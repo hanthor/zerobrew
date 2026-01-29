@@ -443,7 +443,11 @@ impl Installer {
     }
 
     /// Install a cask (Linux only support for now)
-    pub async fn install_cask(&self, name: &str) -> Result<(), Error> {
+    pub async fn install_cask(
+        &self, 
+        name: &str, 
+        progress: Option<Arc<dyn Fn(InstallProgress) + Send + Sync>>,
+    ) -> Result<(), Error> {
         let (path, cask_name) = self.tap_manager.resolve_cask(name)?;
         let content = std::fs::read_to_string(&path).map_err(|e| Error::StoreCorruption {
             message: format!("Failed to read cask file {}: {}", path.display(), e),
@@ -464,8 +468,6 @@ impl Installer {
         let url = cask.url;
         let sha256 = cask.sha256;
         
-        println!("==> Downloading {}...", cask.name);
-        
         // We can reuse downloader but we need a DownloadRequest
         let request = DownloadRequest {
             url: url.clone(),
@@ -474,12 +476,14 @@ impl Installer {
         };
 
         // Download (using single download for simplicity, or we could stream)
-        let blob_path = self.downloader.download_single(request, None).await?;
+        let blob_path = self.downloader.download_single(request, progress.clone()).await?;
 
         // Ensure entry in store (verify checksum)
         let store_entry = self.store.ensure_entry(&sha256, &blob_path)?;
         
-        println!("==> Installing {} {}...", cask.name, cask.version);
+        if let Some(cb) = &progress {
+            cb(InstallProgress::UnpackStarted { name: cask.name.clone() });
+        }
 
         // Prepare Caskroom directory
         // root/Caskroom/name/version
@@ -499,6 +503,11 @@ impl Installer {
         symlink(&store_entry, &caskroom).map_err(|e| Error::StoreCorruption {
              message: format!("Failed to symlink store entry to caskroom: {}", e),
         })?;
+
+        if let Some(cb) = &progress {
+            cb(InstallProgress::UnpackCompleted { name: cask.name.clone() });
+            cb(InstallProgress::LinkStarted { name: cask.name.clone() });
+        }
 
         // Link binaries
         // Scan artifacts
@@ -544,7 +553,11 @@ impl Installer {
              }
         }
 
-        println!("🍺  {}: {} {}", cask_name, cask.version, "installed successfully");
+        if let Some(cb) = &progress {
+            cb(InstallProgress::LinkCompleted { name: cask.name.clone() });
+            cb(InstallProgress::InstallCompleted { name: cask.name.clone() });
+        }
+
         Ok(())
     }
 }
