@@ -1,7 +1,8 @@
+use serde::Serialize;
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Cask {
     pub name: String,
     pub version: String,
@@ -12,7 +13,7 @@ pub struct Cask {
     pub artifacts: Vec<Artifact>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Artifact {
     Binary(String),
     App(String),
