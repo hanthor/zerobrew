@@ -61,6 +61,87 @@ impl Cellar {
         // Copy the content to the cellar using best available strategy
         copy_dir_with_fallback(&src_path, &keg_path)?;
 
+        // If it's a flat archive (no bin, lib, etc. in root but has files),
+        // Heuristic: If there's no bin/ at root, but there's a single directory that contains bin/, promote it
+        if !keg_path.join("bin").exists() && !keg_path.join("lib").exists() {
+            let mut subdirs = Vec::new();
+            if let Ok(entries) = fs::read_dir(&keg_path) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        subdirs.push(entry.path());
+                    }
+                }
+            }
+
+            if subdirs.len() == 1 {
+                let subdir = &subdirs[0];
+                if subdir.join("bin").exists() {
+                    // Promote contents of subdir to keg_path
+                    if let Ok(entries) = fs::read_dir(subdir) {
+                        for entry in entries.flatten() {
+                            let src = entry.path();
+                            let dest = keg_path.join(entry.file_name());
+                            let _ = fs::rename(src, dest);
+                        }
+                    }
+                    // Remove the now-empty subdir
+                    let _ = fs::remove_dir(subdir);
+                }
+            }
+        }
+
+        // Check if we didn't have a bin/ or lib/ directory after possible promotion,
+        if !keg_path.join("bin").exists() && !keg_path.join("lib").exists() {
+            // If there's a single file in the root, move it to bin/name
+            let mut entries_vec = Vec::new();
+            if let Ok(entries) = fs::read_dir(&keg_path) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        entries_vec.push(entry.path());
+                    }
+                }
+            }
+
+            if entries_vec.len() == 1 {
+                let bin_dir = keg_path.join("bin");
+                fs::create_dir_all(&bin_dir).ok();
+                let src = &entries_vec[0];
+                let dest = bin_dir.join(name);
+                if fs::rename(src, &dest).is_ok() {
+                    // Ensure it's executable
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = fs::metadata(&dest) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(perms.mode() | 0o111);
+                            let _ = fs::set_permissions(&dest, perms);
+                        }
+                    }
+                }
+            } else {
+                // Fallback: if we find a file exactly named after the package, put it in bin/
+                let pkg_binary = keg_path.join(name);
+                if pkg_binary.exists() && pkg_binary.is_file() {
+                    let bin_dir = keg_path.join("bin");
+                    fs::create_dir_all(&bin_dir).ok();
+                    let dest = bin_dir.join(name);
+                    if fs::rename(&pkg_binary, &dest).is_ok() {
+                        // Ensure it's executable
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(metadata) = fs::metadata(&dest) {
+                                let mut perms = metadata.permissions();
+                                perms.set_mode(perms.mode() | 0o111);
+                                let _ = fs::set_permissions(&dest, perms);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Patch Homebrew placeholders in Mach-O binaries
         #[cfg(target_os = "macos")]
         patch_homebrew_placeholders(&keg_path, &self.cellar_dir, name, version)?;
@@ -79,6 +160,29 @@ impl Cellar {
                     ),
                 })?;
             patch_placeholders(&keg_path, prefix, name, version)?;
+        }
+
+        // Ensure all files in bin/ are executable (MUST be after patching as patching restores mode)
+        let bin_dir = keg_path.join("bin");
+        if bin_dir.exists()
+            && bin_dir.is_dir()
+            && let Ok(entries) = fs::read_dir(bin_dir)
+        {
+            for entry in entries.flatten() {
+                if let Ok(file_type) = entry.file_type()
+                    && (file_type.is_file() || file_type.is_symlink())
+                {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = fs::metadata(entry.path()) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(perms.mode() | 0o111);
+                            let _ = fs::set_permissions(entry.path(), perms);
+                        }
+                    }
+                }
+            }
         }
 
         // Strip quarantine xattrs and ad-hoc sign Mach-O binaries

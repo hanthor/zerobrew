@@ -16,6 +16,7 @@ enum PackageFormat {
     Zstd,
     Rpm,
     AppImage,
+    Binary,
     Unknown,
 }
 
@@ -53,14 +54,12 @@ fn detect_format(path: &Path) -> Result<PackageFormat, Error> {
         return Ok(PackageFormat::Rpm);
     }
 
-    // AppImage (ELF + AI\x02): 7f 45 4c 46 ... [8] 41 49 02
-    if bytes_read >= 11
-        && magic[0..4] == [0x7f, 0x45, 0x4c, 0x46]
-        && magic[8] == 0x41
-        && magic[9] == 0x49
-        && magic[10] == 0x02
-    {
-        return Ok(PackageFormat::AppImage);
+    // ELF Binary (generic): 7f 45 4c 46
+    if bytes_read >= 4 && magic[0..4] == [0x7f, 0x45, 0x4c, 0x46] {
+        if bytes_read >= 11 && magic[8] == 0x41 && magic[9] == 0x49 && magic[10] == 0x02 {
+            return Ok(PackageFormat::AppImage);
+        }
+        return Ok(PackageFormat::Binary);
     }
 
     Ok(PackageFormat::Unknown)
@@ -73,6 +72,18 @@ pub fn extract_tarball(path: &Path, dest_dir: &Path) -> Result<(), Error> {
     match format {
         PackageFormat::Rpm => return extract_rpm(path, dest_dir),
         PackageFormat::AppImage => return extract_appimage(path, dest_dir),
+        PackageFormat::Binary => {
+            // For raw binaries, just copy the file to the destination.
+            // We'll name it after the file's basename.
+            let file_name = path.file_name().ok_or_else(|| Error::StoreCorruption {
+                message: "invalid package path (no filename)".to_string(),
+            })?;
+            let dest_path = dest_dir.join(file_name);
+            std::fs::copy(path, dest_path).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to copy binary: {e}"),
+            })?;
+            return Ok(());
+        }
         _ => {}
     }
 
