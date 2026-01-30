@@ -202,77 +202,125 @@ fn patch_elf_placeholders(keg_path: &Path, prefix_dir: &Path) -> Result<(), Erro
             let content = fs::read(path)?;
             let mut elf = arwen::elf::ElfContainer::parse(&content)?;
 
+            let apply_patches = |elf: &mut arwen::elf::ElfContainer,
+                                 only_interpreter: bool|
+             -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                // Set page size for alignment (skip if only interpreter to be safe/minimal)
+                if !only_interpreter {
+                    let page_size = elf.get_page_size();
+                    let _ = elf.set_page_size(page_size);
+                }
+
+                if !only_interpreter {
+                    // RPATH
+                    let old_rpaths = elf.get_rpath();
+                    let mut new_rpaths: Vec<String> = if old_rpaths.is_empty() {
+                        Vec::new()
+                    } else {
+                        old_rpaths
+                            .iter()
+                            .map(|r| r.replace(old_prefix, &new_prefix))
+                            .filter(|r| r.starts_with(&new_prefix) || r.starts_with("$ORIGIN"))
+                            .collect()
+                    };
+
+                    if !new_rpaths.contains(&lib_path) {
+                        new_rpaths.push(lib_path.clone());
+                    }
+
+                    let new_rpath_str = new_rpaths.join(":");
+                    if !new_rpath_str.is_empty() {
+                        let _ = elf.set_runpath(&new_rpath_str);
+                    }
+                }
+
+                // Interpreter
+                let is_executable = elf.inner.builder().header.e_type == object::elf::ET_EXEC
+                    || (elf.inner.builder().header.e_type == object::elf::ET_DYN
+                        && elf.inner.elf_interpreter().is_some());
+
+                if is_executable && let Some(current_interp_bytes) = elf.inner.elf_interpreter() {
+                    let current_interp_str = String::from_utf8_lossy(current_interp_bytes);
+
+                    let target_interp_path = if current_interp_str.contains(old_prefix) {
+                        let expanded = current_interp_str.replace(old_prefix, &new_prefix);
+                        let expanded_path = PathBuf::from(&expanded);
+                        if expanded_path.exists() {
+                            Some(expanded_path)
+                        } else {
+                            find_system_ld_so()
+                        }
+                    } else {
+                        target_interpreter.clone()
+                    };
+
+                    if let Some(target_path) = target_interp_path {
+                        let target_str = target_path.to_string_lossy();
+                        let _ = elf.set_interpreter(&target_str);
+                    }
+                }
+
+                Ok(())
+            };
+
+            // First attempt: Try to patch everything
             // Check if it is a dynamic ELF
-            let has_dynamic_segment = elf
+            if !elf
                 .inner
                 .builder()
                 .segments
                 .iter()
-                .any(|s| s.p_type == object::elf::PT_DYNAMIC);
-            if !has_dynamic_segment {
+                .any(|s| s.p_type == object::elf::PT_DYNAMIC)
+            {
                 return Ok(());
             }
 
-            // Set page size for alignment
-            let page_size = elf.get_page_size();
-            let _ = elf.set_page_size(page_size);
-
-            // RPATH
-            let old_rpaths = elf.get_rpath();
-            let mut new_rpaths: Vec<String> = if old_rpaths.is_empty() {
-                Vec::new()
-            } else {
-                old_rpaths
-                    .iter()
-                    .map(|r| r.replace(old_prefix, &new_prefix))
-                    .filter(|r| r.starts_with(&new_prefix) || r.starts_with("$ORIGIN"))
-                    .collect()
-            };
-
-            if !new_rpaths.contains(&lib_path) {
-                new_rpaths.push(lib_path.clone());
-            }
-
-            let new_rpath_str = new_rpaths.join(":");
-            if !new_rpath_str.is_empty() {
-                let _ = elf.set_runpath(&new_rpath_str);
-            }
-
-            // Interpreter
-            let is_executable = elf.inner.builder().header.e_type == object::elf::ET_EXEC
-                || (elf.inner.builder().header.e_type == object::elf::ET_DYN
-                    && elf.inner.elf_interpreter().is_some());
-
-            if is_executable && let Some(current_interp_bytes) = elf.inner.elf_interpreter() {
-                let current_interp_str = String::from_utf8_lossy(current_interp_bytes);
-
-                let target_interp_path = if current_interp_str.contains(old_prefix) {
-                    let expanded = current_interp_str.replace(old_prefix, &new_prefix);
-                    let expanded_path = PathBuf::from(&expanded);
-                    if expanded_path.exists() {
-                        Some(expanded_path)
-                    } else {
-                        find_system_ld_so()
-                    }
-                } else {
-                    target_interpreter.clone()
-                };
-
-                if let Some(target_path) = target_interp_path {
-                    let target_str = target_path.to_string_lossy();
-                    let _ = elf.set_interpreter(&target_str);
-                }
-            }
+            apply_patches(&mut elf, false)?;
 
             // Atomic write
             let temp_path = path.with_extension("tmp_patch");
-            {
+            let write_result = {
                 let mut temp_file = fs::File::create(&temp_path)?;
-                elf.write(&mut temp_file)?;
-            }
-            fs::rename(temp_path, path)?;
+                elf.write(&mut temp_file)
+            };
 
-            Ok(())
+            match write_result {
+                Ok(_) => {
+                    fs::rename(temp_path, path)?;
+                    Ok(())
+                }
+                Err(e) => {
+                    // Check if it's the validation error
+                    let err_str = e.to_string();
+                    if err_str.contains("validation error") {
+                        // Retry with ONLY interpreter
+                         eprintln!(
+                            "Warning: Validation error patching RPATH for {}, retrying with interpreter only...",
+                            path.display()
+                        );
+                        let _ = fs::remove_file(&temp_path); // Cleanup failed write
+
+                        // Re-parse
+                        let mut elf = arwen::elf::ElfContainer::parse(&content)?;
+                        apply_patches(&mut elf, true)?;
+
+                        let mut temp_file = fs::File::create(&temp_path)?;
+                         match elf.write(&mut temp_file) {
+                             Ok(_) => {
+                                 fs::rename(temp_path, path)?;
+                                 Ok(())
+                             }
+                             Err(e2) => {
+                                 let _ = fs::remove_file(&temp_path);
+                                 Err(e2.into())
+                             }
+                         }
+                    } else {
+                         let _ = fs::remove_file(&temp_path);
+                        Err(e.into())
+                    }
+                }
+            }
         })();
 
         if let Err(e) = result {
