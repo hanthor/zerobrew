@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::api::ApiClient;
 use crate::blob::BlobCache;
+use crate::cache::ApiCache;
 use crate::db::Database;
 use crate::download::{
     DownloadProgressCallback, DownloadRequest, DownloadResult, ParallelDownloader,
@@ -443,9 +444,29 @@ impl Installer {
         self.db.list_installed()
     }
 
-    /// List known available items
+    /// List known available items (local taps + cached remote names)
     pub fn list_available_items(&self) -> Vec<String> {
-        self.tap_manager.list_available_items()
+        let mut items = self.tap_manager.list_available_items();
+
+        if let Some(names) = self.api_client.get_cached_formula_names() {
+            items.extend(names);
+        }
+        if let Some(names) = self.api_client.get_cached_cask_names() {
+            items.extend(names);
+        }
+
+        items.sort();
+        items.dedup();
+        items
+    }
+
+    /// Refresh metadata and taps
+    pub async fn update(&self) -> Result<(), Error> {
+        println!("==> Updating formula and cask metadata...");
+        self.api_client.get_all_formula_names().await?;
+        self.api_client.get_all_cask_names().await?;
+        println!("==> Update complete!");
+        Ok(())
     }
 
     /// Install a cask (Linux only support for now)
@@ -620,7 +641,11 @@ pub fn create_installer(
         message: format!("failed to create db directory: {e}"),
     })?;
 
-    let api_client = ApiClient::new();
+    let api_cache =
+        ApiCache::open(&root.join("db/api_cache.sqlite3")).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to open api cache: {e}"),
+        })?;
+    let api_client = ApiClient::new().with_cache(api_cache);
     let blob_cache = BlobCache::new(&root.join("cache")).map_err(|e| Error::StoreCorruption {
         message: format!("failed to create blob cache: {e}"),
     })?;
