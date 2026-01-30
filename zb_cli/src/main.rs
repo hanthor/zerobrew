@@ -43,6 +43,10 @@ enum Commands {
         /// Skip linking executables
         #[arg(long)]
         no_link: bool,
+
+        /// Install as Cask
+        #[arg(long)]
+        cask: bool,
     },
 
     /// Tap a formula repository
@@ -401,7 +405,27 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
     match cli.command {
         Commands::Init => unreachable!(),              // Handled above
         Commands::Completion { .. } => unreachable!(), // Handled above
-        Commands::Install { formula, no_link } => {
+        Commands::Install { formula, no_link, cask } => {
+            let start = Instant::now();
+
+            if cask {
+                println!(
+                    "{} Installing Cask {}...",
+                    style("==>").cyan().bold(),
+                    style(&formula).bold()
+                );
+                
+                installer.install_cask(&formula).await?;
+                
+                let elapsed = start.elapsed();
+                println!();
+                println!(
+                    "{} Installed Cask in {:.2}s",
+                    style("==>").cyan().bold(),
+                    elapsed.as_secs_f64()
+                );
+                return Ok(());
+            }
 
             println!(
                 "{} Installing {}...",
