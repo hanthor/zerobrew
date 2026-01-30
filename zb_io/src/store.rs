@@ -7,12 +7,17 @@ use fs4::fs_std::FileExt;
 use crate::extract::extract_tarball;
 use zb_core::Error;
 
+#[derive(Clone)]
 pub struct Store {
     store_dir: PathBuf,
     locks_dir: PathBuf,
 }
 
 impl Store {
+    pub fn root(&self) -> &Path {
+        self.store_dir.parent().unwrap()
+    }
+
     pub fn new(root: &Path) -> io::Result<Self> {
         let store_dir = root.join("store");
         let locks_dir = root.join("locks");

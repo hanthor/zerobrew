@@ -571,6 +571,7 @@ fn parse_www_authenticate(header: &str) -> Result<(String, String, String), Erro
     Ok((realm, service, scope))
 }
 
+#[derive(Clone, Debug)]
 pub struct DownloadRequest {
     pub url: String,
     pub sha256: String,
@@ -672,16 +673,35 @@ impl ParallelDownloader {
             let sha256 = req.sha256.clone();
 
             tokio::spawn(async move {
-                let result =
-                    Self::download_with_dedup(downloader, semaphore, inflight, req, progress).await;
-                let _ = tx
-                    .send(result.map(|blob_path| DownloadResult {
-                        name,
-                        sha256,
-                        blob_path,
-                        index,
-                    }))
-                    .await;
+                let mut last_result = Err(Error::NetworkFailure { message: "init".into() });
+                for attempt in 0..3 {
+                    let result =
+                        Self::download_with_dedup(downloader.clone(), semaphore.clone(), inflight.clone(), req.clone(), progress.clone()).await;
+                    
+                    match result {
+                        Ok(blob_path) => {
+                            let _ = tx
+                                .send(Ok(DownloadResult {
+                                    name: name.clone(),
+                                    sha256: sha256.clone(),
+                                    blob_path,
+                                    index,
+                                }))
+                                .await;
+                            return;
+                        }
+                        Err(e) => {
+                            last_result = Err(e);
+                            if attempt < 2 {
+                                // Short sleep before retry
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
+                
+                // If we're here, all retries failed
+                let _ = tx.send(last_result).await;
             });
         }
 
