@@ -45,6 +45,12 @@ enum Commands {
         no_link: bool,
     },
 
+    /// Tap a formula repository
+    Tap {
+        /// Tap name (user/repo)
+        name: String,
+    },
+
     /// Uninstall a formula (or all formulas if no name given)
     Uninstall {
         /// Formula name to uninstall (omit to uninstall all)
@@ -396,7 +402,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         Commands::Init => unreachable!(),              // Handled above
         Commands::Completion { .. } => unreachable!(), // Handled above
         Commands::Install { formula, no_link } => {
-            let start = Instant::now();
+
             println!(
                 "{} Installing {}...",
                 style("==>").cyan().bold(),
@@ -648,6 +654,16 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                     style("==>").cyan().bold(),
                     style(removed.len()).green().bold()
                 );
+            }
+        }
+
+        Commands::Tap { name } => {
+             if let Some((user, repo)) = name.split_once('/') {
+                 println!("{} Tapping {}/{}...", style("==>").cyan().bold(), user, repo);
+                 installer.tap(user, repo)?;
+                 println!("{} Tapped successfully", style("✓").green());
+            } else {
+                 return Err(zb_core::Error::UnsupportedTap { name });
             }
         }
 
