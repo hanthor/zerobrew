@@ -1,9 +1,11 @@
 pub mod api;
 pub mod blob;
+pub mod bundle;
 pub mod cache;
 pub mod db;
 pub mod download;
 pub mod extract;
+pub mod formula_parser;
 pub mod install;
 pub mod link;
 #[cfg(target_os = "linux")]
