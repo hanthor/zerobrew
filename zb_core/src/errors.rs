@@ -30,10 +30,7 @@ impl fmt::Display for Error {
             Error::NetworkFailure { message } => write!(f, "network failure: {message}"),
             Error::MissingFormula { name } => write!(f, "missing formula '{name}'"),
             Error::UnsupportedTap { name } => {
-                write!(
-                    f,
-                    "tap formula '{name}' is not supported (only homebrew/core)"
-                )
+                write!(f, "unsupported tap format '{name}' (expected user/repo)")
             }
             Error::DependencyCycle { cycle } => {
                 let rendered = cycle.join(" -> ");
