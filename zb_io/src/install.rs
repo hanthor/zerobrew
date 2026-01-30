@@ -72,6 +72,22 @@ impl Installer {
         }
     }
 
+    pub fn api_client(&self) -> &ApiClient {
+        &self.api_client
+    }
+
+    pub fn prefix(&self) -> &Path {
+        self.store.root()
+    }
+
+    pub fn list_taps(&self) -> Result<Vec<String>, Error> {
+        Ok(self.tap_manager.list_taps())
+    }
+
+    pub fn untap(&self, name: &str) -> Result<(), Error> {
+        self.tap_manager.untap(name)
+    }
+
     /// Resolve dependencies and plan the install
     pub async fn plan(&self, names: &[String]) -> Result<InstallPlan, Error> {
         // Recursively fetch all formulas we need
@@ -238,16 +254,35 @@ impl Installer {
 
                 // Process results and queue new dependencies
                 for (i, result) in results.into_iter().enumerate() {
-                    let formula = result?;
-
-                    // Queue dependencies for next batch
-                    for dep in &formula.dependencies {
-                        if !fetched.contains(dep) && !to_fetch.contains(dep) {
-                            to_fetch.push(dep.clone());
+                    let name = &core_formulas[i];
+                    match result {
+                        Ok(formula) => {
+                            // Queue dependencies for next batch
+                            for dep in &formula.dependencies {
+                                if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                                    to_fetch.push(dep.clone());
+                                }
+                            }
+                            formulas.insert(name.to_string(), formula);
                         }
+                        Err(Error::MissingFormula { .. }) => {
+                            // Try to find in any installed tap
+                            if let Some(formula) = self.tap_manager.find_formula(name) {
+                                // Queue dependencies for next batch
+                                for dep in &formula.dependencies {
+                                    if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                                        to_fetch.push(dep.clone());
+                                    }
+                                }
+                                formulas.insert(name.to_string(), formula);
+                            } else {
+                                return Err(Error::MissingFormula {
+                                    name: name.to_string(),
+                                });
+                            }
+                        }
+                        Err(e) => return Err(e),
                     }
-
-                    formulas.insert(core_formulas[i].clone(), formula);
                 }
             }
         }
@@ -443,6 +478,47 @@ impl Installer {
         Ok(())
     }
 
+    /// Uninstall a cask
+    pub fn uninstall_cask(&mut self, name: &str) -> Result<(), Error> {
+        let installed = self.db.get_installed(name).ok_or(Error::NotInstalled {
+            name: name.to_string(),
+        })?;
+
+        let caskroom = self
+            .store
+            .root()
+            .join("Caskroom")
+            .join(name)
+            .join(&installed.version);
+
+        if caskroom.exists() {
+            // Best-effort cleanup of bin symlinks
+            let bin_dir = self.linker.prefix().join("bin");
+            if let Ok(entries) = std::fs::read_dir(bin_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(target) = std::fs::read_link(entry.path())
+                        && target.starts_with(&caskroom)
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+
+            std::fs::remove_dir_all(&caskroom).map_err(|e| Error::StoreCorruption {
+                message: format!("Failed to remove Caskroom content: {}", e),
+            })?;
+        }
+
+        // Remove from database
+        {
+            let tx = self.db.transaction()?;
+            tx.record_uninstall(name)?;
+            tx.commit()?;
+        }
+
+        Ok(())
+    }
+
     /// Garbage collect unreferenced store entries
     pub fn gc(&mut self) -> Result<Vec<String>, Error> {
         let unreferenced = self.db.get_unreferenced_store_keys()?;
@@ -500,6 +576,95 @@ impl Installer {
         self.api_client.get_all_cask_names().await?;
         println!("==> Update complete!");
         Ok(())
+    }
+
+    /// Check for outdated formulas
+    /// Returns a list of (InstalledKeg, LatestVersion)
+    pub async fn outdated(&self) -> Result<Vec<(crate::db::InstalledKeg, String)>, Error> {
+        let installed = self.db.list_installed()?;
+        if installed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Fetch all summaries for efficient lookup
+        let formula_summaries = self.api_client.get_all_formula_summaries().await?;
+        let cask_summaries = self.api_client.get_all_cask_summaries().await?;
+
+        let mut outdated = Vec::new();
+
+        for keg in installed {
+            // Find latest version
+            // Try formulas first
+            let latest =
+                if let Some(summary) = formula_summaries.iter().find(|s| s.name == keg.name) {
+                    Some(summary.version.clone())
+                } else if let Some(summary) = cask_summaries.iter().find(|s| s.name == keg.name) {
+                    Some(summary.version.clone())
+                } else {
+                    // Not found in API, check local taps
+                    if let Ok(formula) = self.tap_manager.resolve_formula(&keg.name) {
+                        Some(formula.effective_version())
+                    } else if let Ok((path, _)) = self.tap_manager.resolve_cask(&keg.name) {
+                        // Parse cask version
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            // Very rough parse for version
+                            content
+                                .lines()
+                                .find(|l| l.trim().starts_with("version "))
+                                .and_then(|l| l.split_whitespace().nth(1))
+                                .map(|s| s.trim_matches('\'').trim_matches('"').to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+            if let Some(latest_version) = latest {
+                // Simple string comparison for now, ideally strictly semver but brew versions vary
+                if latest_version != keg.version {
+                    // Check if it's actually newer (lexicographical check is flawed but common baseline)
+                    // TODO: Implement proper version comparison similar to Brew's logic
+                    outdated.push((keg, latest_version));
+                }
+            }
+        }
+
+        Ok(outdated)
+    }
+
+    /// Upgrade installed formulas
+    pub async fn upgrade(
+        &mut self,
+        formulas: Option<Vec<String>>,
+        dry_run: bool,
+    ) -> Result<ExecuteResult, Error> {
+        let outdated = self.outdated().await?;
+
+        let targets: Vec<(crate::db::InstalledKeg, String)> = if let Some(asked) = formulas {
+            outdated
+                .into_iter()
+                .filter(|(k, _)| asked.contains(&k.name))
+                .collect()
+        } else {
+            outdated
+        };
+
+        if targets.is_empty() {
+            return Ok(ExecuteResult { installed: 0 });
+        }
+
+        if dry_run {
+            println!("Would upgrade:");
+            for (keg, new_ver) in &targets {
+                println!("{} -> {}", keg.name, new_ver);
+            }
+            return Ok(ExecuteResult { installed: 0 });
+        }
+
+        let names: Vec<String> = targets.iter().map(|(k, _)| k.name.clone()).collect();
+        self.install_many(&names, true).await
     }
 
     /// Install a cask (Linux only support for now)
