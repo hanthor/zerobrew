@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::os::unix::fs::symlink;
 use std::sync::Arc;
 
 use crate::api::ApiClient;
@@ -13,7 +14,8 @@ use crate::materialize::Cellar;
 use crate::progress::{InstallProgress, ProgressCallback};
 use crate::store::Store;
 
-use zb_core::{Error, Formula, SelectedBottle, resolve_closure, select_bottle};
+use crate::tap::TapManager;
+use zb_core::{Cask, Error, Formula, SelectedBottle, resolve_closure, select_bottle};
 
 /// Maximum number of retries for corrupted downloads
 const MAX_CORRUPTION_RETRIES: usize = 3;
@@ -25,6 +27,7 @@ pub struct Installer {
     cellar: Cellar,
     linker: Linker,
     db: Database,
+    tap_manager: TapManager,
 }
 
 pub struct InstallPlan {
@@ -53,6 +56,7 @@ impl Installer {
         cellar: Cellar,
         linker: Linker,
         db: Database,
+        tap_manager: TapManager,
         download_concurrency: usize,
     ) -> Self {
         Self {
@@ -62,6 +66,7 @@ impl Installer {
             cellar,
             linker,
             db,
+            tap_manager,
         }
     }
 
@@ -431,6 +436,111 @@ impl Installer {
     pub fn list_installed(&self) -> Result<Vec<crate::db::InstalledKeg>, Error> {
         self.db.list_installed()
     }
+
+    /// Install a cask (Linux only support for now)
+    pub async fn install_cask(&self, name: &str) -> Result<(), Error> {
+        let (path, cask_name) = self.tap_manager.resolve_cask(name)?;
+        let content = std::fs::read_to_string(&path).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to read cask file {}: {}", path.display(), e),
+        })?;
+
+        // Determine arch for logic
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64_linux"
+        } else {
+            "x86_64_linux"
+        };
+
+        let cask = Cask::parse(&content, arch).map_err(|e| Error::FormulaParseError {
+            message: e.to_string(),
+        })?;
+
+        // Download artifact
+        let url = cask.url;
+        let sha256 = cask.sha256;
+        
+        println!("==> Downloading {}...", cask.name);
+        
+        // We can reuse downloader but we need a DownloadRequest
+        let request = DownloadRequest {
+            url: url.clone(),
+            sha256: sha256.clone(),
+            name: cask_name.clone(),
+        };
+
+        // Download (using single download for simplicity, or we could stream)
+        let blob_path = self.downloader.download_single(request, None).await?;
+
+        // Ensure entry in store (verify checksum)
+        let store_entry = self.store.ensure_entry(&sha256, &blob_path)?;
+        
+        println!("==> Installing {} {}...", cask.name, cask.version);
+
+        // Prepare Caskroom directory
+        // root/Caskroom/name/version
+        let caskroom = self.store.root().join("Caskroom").join(&cask_name).join(&cask.version);
+        if caskroom.exists() {
+             std::fs::remove_dir_all(&caskroom).map_err(|e| Error::StoreCorruption {
+                 message: format!("Failed to remove existing caskroom dir: {}", e),
+             })?;
+        }
+        std::fs::create_dir_all(&caskroom).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to create caskroom: {}", e),
+        })?;
+
+        // Extract
+        // zb_io::extract::extract_tarball uses tar/flate2.
+        crate::extract::extract_tarball(&store_entry, &caskroom).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to extract cask: {}", e),
+        })?;
+
+        // Link binaries
+        // Scan artifacts
+        for artifact in cask.artifacts {
+            match artifact {
+                zb_core::cask::Artifact::Binary(bin_path) => {
+                     // bin_path is relative to staged path (caskroom)
+                     let source = caskroom.join(&bin_path);
+                     if !source.exists() {
+                         eprintln!("Warning: Binary {} not found", source.display());
+                         continue;
+                     }
+                     
+                     let name = source.file_name().unwrap();
+                     let target = self.linker.prefix().join("bin").join(name);
+                     
+                     // Helper: create symlink
+                     if target.exists() {
+                         std::fs::remove_file(&target).ok();
+                     }
+                     symlink(&source, &target).map_err(|e| Error::StoreCorruption {
+                        message: format!("Failed to symlink binary: {}", e),
+                     })?;
+                }
+                _ => {
+                    // Ignore other artifacts for now
+                }
+            }
+        }
+        
+        // Single binary field support (legacy)
+        if let Some(bin_path) = cask.binary {
+             let source = caskroom.join(&bin_path);
+             if source.exists() {
+                 let name = source.file_name().unwrap();
+                 let target = self.linker.prefix().join("bin").join(name);
+                 if target.exists() {
+                     std::fs::remove_file(&target).ok();
+                 }
+                 symlink(&source, &target).map_err(|e| Error::StoreCorruption {
+                    message: format!("Failed to symlink binary: {}", e),
+                 })?;
+             }
+        }
+
+        println!("🍺  {}: {} {}", cask_name, cask.version, "installed successfully");
+        Ok(())
+    }
 }
 
 /// Create an Installer with standard paths
@@ -490,6 +600,7 @@ pub fn create_installer(
         cellar,
         linker,
         db,
+        TapManager::new(root.to_path_buf()),
         download_concurrency,
     ))
 }
@@ -606,7 +717,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install
         installer.install("testpkg", true).await.unwrap();
@@ -684,7 +796,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install
         installer.install("uninstallme", true).await.unwrap();
@@ -761,7 +874,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install and uninstall
         installer.install("gctest", true).await.unwrap();
@@ -841,7 +955,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install but don't uninstall
         installer.install("keepme", true).await.unwrap();
@@ -955,7 +1070,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install main package (should also install dependency)
         installer.install("mainpkg", true).await.unwrap();
@@ -1058,7 +1174,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install root (should install all 5 packages)
         installer.install("root", true).await.unwrap();
@@ -1145,7 +1262,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install slow package (which depends on fast)
         // With streaming, fast should be extracted while slow is still downloading
@@ -1249,7 +1367,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install - should succeed (first download is valid in this test)
         installer.install("retrypkg", true).await.unwrap();

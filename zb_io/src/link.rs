@@ -17,6 +17,10 @@ pub struct LinkedFile {
 }
 
 impl Linker {
+    pub fn prefix(&self) -> &Path {
+        &self.prefix
+    }
+
     pub fn new(prefix: &Path) -> io::Result<Self> {
         let bin_dir = prefix.join("bin");
         let opt_dir = prefix.join("opt");

@@ -13,6 +13,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn root(&self) -> &Path {
+        self.store_dir.parent().unwrap()
+    }
+
     pub fn new(root: &Path) -> io::Result<Self> {
         let store_dir = root.join("store");
         let locks_dir = root.join("locks");
