@@ -7,6 +7,11 @@ pub struct ApiClient {
     cache: Option<ApiCache>,
 }
 
+enum EntryType {
+    Formula,
+    Cask,
+}
+
 impl ApiClient {
     pub fn new() -> Self {
         Self::with_base_url("https://formulae.brew.sh/api/formula".to_string())
@@ -104,6 +109,168 @@ impl ApiClient {
         })?;
 
         Ok(formula)
+    }
+    pub async fn get_all_formula_names(&self) -> Result<Vec<String>, Error> {
+        self.fetch_names_from_list(
+            "https://formulae.brew.sh/api/formula.json",
+            EntryType::Formula,
+        )
+        .await
+    }
+
+    pub async fn get_all_cask_names(&self) -> Result<Vec<String>, Error> {
+        self.fetch_names_from_list("https://formulae.brew.sh/api/cask.json", EntryType::Cask)
+            .await
+    }
+
+    async fn fetch_names_from_list(
+        &self,
+        url: &str,
+        entry_type: EntryType,
+    ) -> Result<Vec<String>, Error> {
+        let cached_entry = self.cache.as_ref().and_then(|c| c.get(url));
+        let mut request = self.client.get(url);
+
+        if let Some(ref entry) = cached_entry {
+            if let Some(ref etag) = entry.etag {
+                request = request.header("If-None-Match", etag.as_str());
+            }
+            if let Some(ref last_modified) = entry.last_modified {
+                request = request.header("If-Modified-Since", last_modified.as_str());
+            }
+        }
+
+        let response = request.send().await.map_err(|e| Error::NetworkFailure {
+            message: e.to_string(),
+        })?;
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED
+            && let Some(entry) = cached_entry
+        {
+            let names: Vec<String> =
+                serde_json::from_str(&entry.body).map_err(|e| Error::NetworkFailure {
+                    message: format!("failed to parse cached names JSON: {e}"),
+                })?;
+            return Ok(names);
+        }
+
+        if !response.status().is_success() {
+            return Err(Error::NetworkFailure {
+                message: format!("HTTP {}", response.status()),
+            });
+        }
+
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let last_modified = response
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let body = response.text().await.map_err(|e| Error::NetworkFailure {
+            message: format!("failed to read response body: {e}"),
+        })?;
+
+        // Extract names
+        #[derive(serde::Deserialize)]
+        struct BottleStable {
+            files: Option<std::collections::HashMap<String, serde_json::Value>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Bottle {
+            stable: Option<BottleStable>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Item {
+            name: Option<serde_json::Value>,
+            token: Option<String>,
+            #[serde(default)]
+            bottle: Option<Bottle>,
+        }
+        let items: Vec<Item> = serde_json::from_str(&body).map_err(|e| Error::NetworkFailure {
+            message: format!("failed to parse full list JSON: {e}"),
+        })?;
+
+        let names: Vec<String> = items
+            .into_iter()
+            .filter_map(|i| {
+                // OS-based filtering
+                if cfg!(target_os = "linux") {
+                    if matches!(entry_type, EntryType::Cask) {
+                        return None;
+                    }
+                    // Filter formulas: if bottle info exists, ensure it has linux support
+                    if matches!(entry_type, EntryType::Formula) {
+                        let bottle_files = i
+                            .bottle
+                            .as_ref()
+                            .and_then(|b| b.stable.as_ref())
+                            .and_then(|s| s.files.as_ref());
+
+                        if let Some(files) = bottle_files {
+                            let has_linux = files
+                                .keys()
+                                .any(|k| k.contains("linux") || k == "all" || k == "x86_64_linux");
+                            if !has_linux {
+                                return None;
+                            }
+                        }
+                    }
+                } else if cfg!(target_os = "macos") {
+                    // On macOS, we generally support everything, but could filter linux-only bottles if they existed
+                    // For now, accept all schemas on macOS
+                }
+
+                if let Some(token) = i.token {
+                    Some(token)
+                } else if let Some(name_val) = i.name {
+                    if let Some(name_str) = name_val.as_str() {
+                        Some(name_str.to_string())
+                    } else if name_val.is_array() {
+                        // This happens for Casks if we look at 'name' field, but we should use 'token'
+                        // However, some might not have token? (unlikely for brew api)
+                        None
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if let Some(ref cache) = self.cache {
+            let names_json = serde_json::to_string(&names).unwrap();
+            let entry = CacheEntry {
+                etag,
+                last_modified,
+                body: names_json,
+            };
+            let _ = cache.put(url, &entry);
+        }
+
+        Ok(names)
+    }
+
+    pub fn get_cached_formula_names(&self) -> Option<Vec<String>> {
+        let url = "https://formulae.brew.sh/api/formula.json";
+        self.cache
+            .as_ref()
+            .and_then(|c| c.get(url))
+            .and_then(|entry| serde_json::from_str(&entry.body).ok())
+    }
+
+    pub fn get_cached_cask_names(&self) -> Option<Vec<String>> {
+        let url = "https://formulae.brew.sh/api/cask.json";
+        self.cache
+            .as_ref()
+            .and_then(|c| c.get(url))
+            .and_then(|entry| serde_json::from_str(&entry.body).ok())
     }
 }
 
