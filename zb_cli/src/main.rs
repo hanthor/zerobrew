@@ -93,6 +93,9 @@ enum Commands {
     /// Internal command for dynamic completion listing
     #[command(hide = true)]
     InternalCompletionList,
+
+    /// Update formula and cask metadata
+    Update,
 }
 
 #[tokio::main]
@@ -499,6 +502,10 @@ _zb_dynamic_formulas() {
             for item in items {
                 println!("{}", item);
             }
+            return Ok(());
+        }
+        Commands::Update => {
+            installer.update().await?;
             return Ok(());
         }
         Commands::Install {
