@@ -12,6 +12,7 @@ pub enum Error {
     UnsupportedTap { name: String },
     DependencyCycle { cycle: Vec<String> },
     NotInstalled { name: String },
+    FormulaParseError { message: String },
 }
 
 impl fmt::Display for Error {
@@ -37,6 +38,7 @@ impl fmt::Display for Error {
                 write!(f, "dependency cycle detected: {rendered}")
             }
             Error::NotInstalled { name } => write!(f, "formula '{name}' is not installed"),
+            Error::FormulaParseError { message } => write!(f, "formula parse error: {message}"),
         }
     }
 }
