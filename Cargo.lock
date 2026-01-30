@@ -2391,6 +2391,8 @@ dependencies = [
  "futures",
  "indicatif",
  "libc",
+ "serde",
+ "serde_json",
  "tokio",
  "zb_core",
  "zb_io",

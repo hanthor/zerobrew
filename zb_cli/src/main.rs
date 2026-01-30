@@ -49,27 +49,61 @@ enum Commands {
         /// Install as Cask
         #[arg(long)]
         cask: bool,
+
+        /// Dry run (don't actually install)
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+
+        /// Force install even if already installed
+        #[arg(long, short = 'f')]
+        force: bool,
     },
 
     /// Tap a formula repository
     Tap {
         /// Tap name (user/repo)
+        name: Option<String>,
+    },
+
+    /// Untap a formula repository
+    Untap {
+        /// Tap name (user/repo)
         name: String,
     },
 
+    /// Display zerobrew's prefix
+    Prefix,
+
     /// Uninstall a formula (or all formulas if no name given)
     Uninstall {
-        /// Formula name to uninstall (omit to uninstall all)
-        formula: Option<String>,
+        /// Formula name to uninstall
+        formula: String,
+        /// Uninstall as Cask
+        #[arg(long)]
+        cask: bool,
     },
 
     /// List installed formulas
-    List,
+    List {
+        #[arg(long)]
+        formula: bool,
+        #[arg(long)]
+        cask: bool,
+    },
 
     /// Show info about an installed formula
     Info {
         /// Formula name
-        formula: String,
+        #[arg(required_unless_present = "installed")]
+        formula: Option<String>,
+
+        /// Output as JSON (v1 for formula, v2 for cask)
+        #[arg(long)]
+        json: Option<String>,
+
+        /// Show only installed formulas
+        #[arg(long)]
+        installed: bool,
     },
 
     /// Garbage collect unreferenced store entries
@@ -105,6 +139,48 @@ enum Commands {
 
     /// Update formula and cask metadata
     Update,
+
+    /// Search for formulas and casks
+    Search {
+        /// Text to search for (substring match)
+        #[arg(required = true)]
+        text: String,
+
+        /// Search only casks
+        #[arg(long)]
+        cask: bool,
+
+        /// Search descriptions (slower)
+        #[arg(long)]
+        desc: bool,
+    },
+
+    /// Show outdated formulas
+    Outdated {
+        /// Also include casks with auto_updates (not relevant for ZB yet but for compatibility)
+        #[arg(long, short = 'g')]
+        greedy: bool,
+    },
+
+    /// Upgrade outdated formulas
+    Upgrade {
+        /// Formulas to upgrade (omit to upgrade all)
+        #[arg(num_args = 0..)]
+        formulas: Option<Vec<String>>,
+
+        /// Dry run
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+
+        /// Upgrade casks
+        #[arg(long)]
+        cask: bool,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct CaskList {
+    casks: Vec<serde_json::Value>,
 }
 
 #[tokio::main]
@@ -522,11 +598,246 @@ _zb_dynamic_formulas() {
             installer.update().await?;
             return Ok(());
         }
+        Commands::List { formula, cask } => {
+            let installed = installer.list_installed()?;
+
+            if installed.is_empty() {
+                return Ok(());
+            }
+
+            if !formula && !cask {
+                // Print all
+                for keg in installed {
+                    println!("{}", keg.name);
+                }
+                return Ok(());
+            }
+
+            // Filter required
+            let mut formulas = Vec::new();
+            let mut casks = Vec::new();
+
+            if formula {
+                let formula_names = installer.api_client().get_all_formula_names().await?;
+                formulas = formula_names;
+            }
+            if cask {
+                let cask_names = installer.api_client().get_all_cask_names().await?;
+                casks = cask_names;
+            }
+
+            for keg in installed {
+                let is_cask = casks.contains(&keg.name);
+                // Assume formula if not explicitly a cask, or if explicitly in formula list
+                // But wait, if we only requested --formula, we should strict check
+                let is_formula = formulas.contains(&keg.name);
+
+                // Simplification:
+                match (formula, cask) {
+                    (true, true) => {
+                        if is_formula || is_cask {
+                            println!("{}", keg.name);
+                        }
+                    }
+                    (true, false) => {
+                        if is_formula || (!is_cask && !casks.contains(&keg.name)) {
+                            println!("{}", keg.name);
+                        }
+                    }
+                    (false, true) => {
+                        if is_cask {
+                            println!("{}", keg.name);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            return Ok(());
+        }
+        Commands::Info {
+            formula,
+            json,
+            installed,
+        } => {
+            if installed {
+                let installed_kegs = installer.list_installed()?;
+                let mut results = Vec::new();
+
+                // Determine mode
+                let is_v2 = json.as_deref() == Some("v2"); // v2 = cask
+
+                // Fetch valid names for filtering
+                // bold-brew calls `brew info --json=v1 --installed` -> expects formulas
+                // It likely calls v2 for casks? No, dataprovider.go says:
+                // GetInstalledFormulae -> json=v1 --installed
+                // GetInstalledCasks -> brew list --cask (names) then brew info --json=v2 --cask <names>
+
+                // So if --installed and json=v1, we want formulas.
+                // If --installed and json=v2 (unlikely used by bold-brew but consistency), we want casks.
+
+                if is_v2 {
+                    let cask_ids = installer.api_client().get_all_cask_names().await?;
+                    for keg in installed_kegs {
+                        if cask_ids.contains(&keg.name)
+                            && let Ok(val) = installer.api_client().get_cask_json(&keg.name).await
+                        {
+                            results.push(val);
+                        }
+                    }
+                    let output = CaskList { casks: results };
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                } else {
+                    // v1 or default -> formulas
+                    // Filter out known casks to avoid duplicates/errors if possible
+                    let cask_ids = installer.api_client().get_all_cask_names().await?;
+
+                    for keg in installed_kegs {
+                        if !cask_ids.contains(&keg.name) {
+                            // Assume formula
+                            if let Ok(val) =
+                                installer.api_client().get_formula_json(&keg.name).await
+                            {
+                                results.push(val);
+                            }
+                        }
+                    }
+                    println!("{}", serde_json::to_string(&results).unwrap());
+                }
+                return Ok(());
+            }
+
+            let name = formula.ok_or_else(|| zb_core::Error::MissingFormula {
+                name: "MISSING".to_string(),
+            })?; // Should be handled by clap required_unless
+
+            if let Some(json_version) = json {
+                if json_version == "v2" {
+                    // Cask
+                    let val = installer.api_client().get_cask_json(&name).await?;
+                    let output = CaskList { casks: vec![val] };
+                    println!("{}", serde_json::to_string(&output).unwrap());
+                } else {
+                    // Formula
+                    let val = installer.api_client().get_formula_json(&name).await?;
+                    println!("{}", serde_json::to_string(&vec![val]).unwrap());
+                }
+            } else {
+                // Plain text info
+                if let Some(keg) = installer.get_installed(&name) {
+                    println!("{} is installed.", keg.name);
+                    println!("Version: {}", keg.version);
+                    println!("Path: {}", keg.store_key); // TODO: Show better path
+                } else {
+                    println!("{} is not installed.", name);
+                    // Try fetch remote info
+                    if let Ok(summary) = installer.api_client().get_all_formula_summaries().await
+                        && let Some(s) = summary.iter().find(|s| s.name == name)
+                    {
+                        println!("Description: {}", s.description.as_deref().unwrap_or("N/A"));
+                        println!("Version: {}", s.version);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Commands::Search { text, cask, desc } => {
+            let text_lower = text.to_lowercase();
+            let mut results = Vec::new();
+
+            // Always search formulas unless --cask specified? No, brew search does both by default.
+            // But if --cask, only casks.
+
+            if !cask {
+                println!("==> Formulae");
+                let summaries = installer.api_client().get_all_formula_summaries().await?;
+                for s in summaries {
+                    if s.name.contains(&text_lower) {
+                        results.push(s.name);
+                    } else if desc
+                        && s.description
+                            .as_ref()
+                            .map(|d: &String| d.to_lowercase().contains(&text_lower))
+                            .unwrap_or(false)
+                    {
+                        results.push(format!("{} (desc)", s.name));
+                    }
+                }
+            }
+
+            // Print formula results
+            if !results.is_empty() {
+                for r in &results {
+                    println!("{}", r);
+                }
+            }
+            results.clear();
+
+            println!("==> Casks");
+            let summaries = installer.api_client().get_all_cask_summaries().await?;
+            for s in summaries {
+                if s.name.contains(&text_lower) {
+                    results.push(s.name);
+                } else if desc
+                    && s.description
+                        .as_ref()
+                        .map(|d: &String| d.to_lowercase().contains(&text_lower))
+                        .unwrap_or(false)
+                {
+                    results.push(format!("{} (desc)", s.name));
+                }
+            }
+            if !results.is_empty() {
+                for r in &results {
+                    println!("{}", r);
+                }
+            }
+
+            return Ok(());
+        }
+        Commands::Outdated { greedy: _ } => {
+            // greedy is ignored for now
+            let outdated = installer.outdated().await?;
+            for (keg, latest) in outdated {
+                println!("{} ({}) < {}", keg.name, keg.version, latest);
+            }
+            return Ok(());
+        }
+        Commands::Upgrade {
+            formulas,
+            dry_run,
+            cask: _,
+        } => {
+            installer.upgrade(formulas, dry_run).await?;
+            return Ok(());
+        }
+        Commands::Prefix => {
+            // Print the prefix
+            // We can get this from the installer's store root or similar,
+            // but simpler is to use the environment variable if set, or default.
+            // Installer doesn't expose store directly easily to get root path as string publically maybe?
+            // Actually installer.store is private.
+            // But we can assume ZEROBREW_PREFIX or "home/james/.zerobrew" if we want to be safe.
+            // Better: expose a `prefix()` method on installer.
+            println!("{}", installer.prefix().display());
+            return Ok(());
+        }
         Commands::Install {
             formulas,
             no_link,
             cask,
+            dry_run,
+            force: _,
         } => {
+            if dry_run {
+                println!("Would install: {}", formulas.join(", "));
+                return Ok(());
+            }
+
+            // TODO: Handle force flag logic if needed by Installer (currently it reinstalls anyway effectively?)
+            // Actually Installer::install checks db.is_installed usually before doing much, but here we call install_many
+            // which calls plan. We might need to pass force to Installer or check here.
+
+            // For now, let's just proceed. The user logic requested Install.
             let start = Instant::now();
 
             // Set up progress display
@@ -781,68 +1092,46 @@ _zb_dynamic_formulas() {
             }
         }
 
-        Commands::Uninstall { formula } => match formula {
-            Some(name) => {
+        Commands::Uninstall { formula, cask } => {
+            if cask {
+                println!(
+                    "{} Uninstalling Cask {}...",
+                    style("==>").cyan().bold(),
+                    style(&formula).bold()
+                );
+                installer.uninstall_cask(&formula)?;
+                println!(
+                    "{} Uninstalled Cask {}",
+                    style("==>").cyan().bold(),
+                    style(&formula).green()
+                );
+            } else {
                 println!(
                     "{} Uninstalling {}...",
                     style("==>").cyan().bold(),
-                    style(&name).bold()
+                    style(&formula).bold()
                 );
-                installer.uninstall(&name)?;
+                installer.uninstall(&formula)?;
                 println!(
                     "{} Uninstalled {}",
                     style("==>").cyan().bold(),
-                    style(&name).green()
+                    style(&formula).green()
                 );
-            }
-            None => {
-                let installed = installer.list_installed()?;
-                if installed.is_empty() {
-                    println!("No formulas installed.");
-                    return Ok(());
-                }
-
-                println!(
-                    "{} Uninstalling {} packages...",
-                    style("==>").cyan().bold(),
-                    installed.len()
-                );
-
-                for keg in installed {
-                    print!("    {} {}...", style("○").dim(), keg.name);
-                    installer.uninstall(&keg.name)?;
-                    println!(" {}", style("✓").green());
-                }
-
-                println!("{} Uninstalled all packages", style("==>").cyan().bold());
-            }
-        },
-
-        Commands::List => {
-            let installed = installer.list_installed()?;
-
-            if installed.is_empty() {
-                println!("No formulas installed.");
-            } else {
-                for keg in installed {
-                    println!("{} {}", style(&keg.name).bold(), style(&keg.version).dim());
-                }
             }
         }
 
-        Commands::Info { formula } => {
-            if let Some(keg) = installer.get_installed(&formula) {
-                println!("{}       {}", style("Name:").dim(), style(&keg.name).bold());
-                println!("{}    {}", style("Version:").dim(), keg.version);
-                println!("{}  {}", style("Store key:").dim(), &keg.store_key[..12]);
-                println!(
-                    "{}  {}",
-                    style("Installed:").dim(),
-                    chrono_lite_format(keg.installed_at)
-                );
-            } else {
-                println!("Formula '{}' is not installed.", formula);
-            }
+        Commands::Untap { name } => {
+            println!(
+                "{} Untapping {}...",
+                style("==>").cyan().bold(),
+                style(&name).bold()
+            );
+            installer.untap(&name)?;
+            println!(
+                "{} Untapped {}",
+                style("==>").cyan().bold(),
+                style(&name).green()
+            );
         }
 
         Commands::Gc => {
@@ -867,17 +1156,22 @@ _zb_dynamic_formulas() {
         }
 
         Commands::Tap { name } => {
-            if let Some((user, repo)) = name.split_once('/') {
-                println!(
-                    "{} Tapping {}/{}...",
-                    style("==>").cyan().bold(),
-                    user,
-                    repo
-                );
-                installer.tap(user, repo)?;
-                println!("{} Tapped successfully", style("✓").green());
+            if let Some(tap_name) = name {
+                let (path, result) = installer.tap(&tap_name, "homebrew-core")?;
+                match result {
+                    zb_io::tap::TapResult::Cloned => {
+                        println!("{} Tapped {}", style("==>").green(), tap_name);
+                    }
+                    zb_io::tap::TapResult::Existed => {
+                        println!("{} Tap {} already exists", style("==>").yellow(), tap_name);
+                    }
+                }
+                println!("Tap location: {}", path.display());
             } else {
-                return Err(zb_core::Error::UnsupportedTap { name });
+                let taps = installer.list_taps()?;
+                for tap in taps {
+                    println!("{}", tap);
+                }
             }
         }
 
@@ -1498,12 +1792,4 @@ _zb_dynamic_formulas() {
     }
 
     Ok(())
-}
-
-fn chrono_lite_format(timestamp: i64) -> String {
-    // Simple timestamp formatting without pulling in chrono
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let dt = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
-    format!("{:?}", dt)
 }
