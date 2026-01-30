@@ -5,10 +5,10 @@ type InDegreeMap = BTreeMap<String, usize>;
 type AdjacencyMap = BTreeMap<String, BTreeSet<String>>;
 
 pub fn resolve_closure(
-    root: &str,
+    roots: &[String],
     formulas: &BTreeMap<String, Formula>,
 ) -> Result<Vec<String>, Error> {
-    let closure = compute_closure(root, formulas)?;
+    let closure = compute_closure(roots, formulas)?;
     let (mut indegree, adjacency) = build_graph(&closure, formulas)?;
 
     let mut ready: BTreeSet<String> = indegree
@@ -50,11 +50,11 @@ pub fn resolve_closure(
 }
 
 fn compute_closure(
-    root: &str,
+    roots: &[String],
     formulas: &BTreeMap<String, Formula>,
 ) -> Result<BTreeSet<String>, Error> {
     let mut closure = BTreeSet::new();
-    let mut stack = vec![root.to_string()];
+    let mut stack = roots.to_vec();
 
     while let Some(name) = stack.pop() {
         if !closure.insert(name.clone()) {
@@ -141,7 +141,7 @@ mod tests {
         formulas.insert("baz".to_string(), formula("baz", &["qux"]));
         formulas.insert("qux".to_string(), formula("qux", &[]));
 
-        let order = resolve_closure("foo", &formulas).unwrap();
+        let order = resolve_closure(&["foo".to_string()], &formulas).unwrap();
         assert_eq!(order, vec!["qux", "bar", "baz", "foo"]);
     }
 
@@ -152,7 +152,24 @@ mod tests {
         formulas.insert("beta".to_string(), formula("beta", &["gamma"]));
         formulas.insert("gamma".to_string(), formula("gamma", &["alpha"]));
 
-        let err = resolve_closure("alpha", &formulas).unwrap_err();
+        let err = resolve_closure(&["alpha".to_string()], &formulas).unwrap_err();
         assert!(matches!(err, Error::DependencyCycle { .. }));
+    }
+    #[test]
+    fn resolves_multiple_roots() {
+        let mut formulas = BTreeMap::new();
+        formulas.insert("foo".to_string(), formula("foo", &["bar"]));
+        formulas.insert("bar".to_string(), formula("bar", &[]));
+        formulas.insert("baz".to_string(), formula("baz", &["qux"]));
+        formulas.insert("qux".to_string(), formula("qux", &[]));
+
+        let order = resolve_closure(&["foo".to_string(), "baz".to_string()], &formulas).unwrap();
+
+        // Check topological order constraints
+        let pos = |name: &str| order.iter().position(|x| x == name).unwrap();
+
+        assert!(pos("bar") < pos("foo"));
+        assert!(pos("qux") < pos("baz"));
+        assert_eq!(order.len(), 4);
     }
 }
