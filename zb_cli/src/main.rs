@@ -3,7 +3,7 @@ use clap_complete::generate;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
-use std::io;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,10 @@ enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::shells::Shell,
     },
+
+    /// Internal command for dynamic completion listing
+    #[command(hide = true)]
+    InternalCompletionList,
 }
 
 #[tokio::main]
@@ -362,10 +366,94 @@ fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
 }
 
 async fn run(cli: Cli) -> Result<(), zb_core::Error> {
-    // Handle completion first - it doesn't need the installer
+    // Handle completion first - it doesn't need the installer, but we might inject dynamic logic
     if let Commands::Completion { shell } = cli.command {
         let mut cmd = Cli::command();
-        generate(shell, &mut cmd, "zb", &mut io::stdout());
+        // Generate into a buffer
+        let mut buffer = Vec::new();
+        generate(shell, &mut cmd, "zb", &mut buffer);
+        let script = String::from_utf8(buffer).unwrap();
+        let exe_path = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "zb".to_string());
+
+        match shell {
+            clap_complete::shells::Shell::Bash => {
+                // For bash, we use the override wrapper approach which is reliable
+                println!("{}", script);
+                println!(
+                    "{}",
+                    r#"
+_zb_dynamic_formulas() {
+    "{exe_path}" internal-completion-list
+}
+
+_zb_override() {
+    local cur prev words cword
+    # Try init_completion but fallback if not available
+    if declare -f _init_completion >/dev/null; then
+        _init_completion || return
+    else
+        COMPREPLY=()
+        if [[ -n "${COMP_WORDS-}" ]]; then
+            cur="${COMP_WORDS[COMP_CWORD]}"
+            prev="${COMP_WORDS[COMP_CWORD-1]}"
+            words=("${COMP_WORDS[@]}")
+        fi
+    fi
+
+    local command=${words[1]}
+    
+    if [[ "$command" == "install" || "$command" == "info" || "$command" == "uninstall" ]]; then
+         local cur=${words[COMP_CWORD]}
+         if [[ "$cur" != -* ]]; then
+             local formulas=$(_zb_dynamic_formulas)
+             COMPREPLY=( $(compgen -W "${formulas}" -- "${cur}") )
+             return 0
+         fi
+    fi
+    
+    # Fallback to original
+    _zb
+}
+
+complete -F _zb_override -o nosort -o bashdefault -o default zb
+"#
+                    .replace("{exe_path}", &exe_path)
+                );
+            }
+            clap_complete::shells::Shell::Zsh => {
+                // For Zsh, we can inject a helper function and use it in _arguments
+                let mut dynamic_script = script.replace(
+                    ":formula -- Formula name to install:_default",
+                    ":formula -- Formula name to install:_zb_dynamic_formulas",
+                );
+                dynamic_script = dynamic_script.replace(
+                    ":formula -- Formula name to uninstall (omit to uninstall all):_default",
+                    ":formula -- Formula name to uninstall (omit to uninstall all):_zb_dynamic_formulas",
+                );
+                dynamic_script = dynamic_script.replace(
+                    ":formula -- Formula name:_default",
+                    ":formula -- Formula name:_zb_dynamic_formulas",
+                );
+
+                println!("{}", dynamic_script);
+                println!(
+                    "{}",
+                    r#"
+_zb_dynamic_formulas() {
+  local -a formulas
+  formulas=( $("{exe_path}" internal-completion-list 2>/dev/null) )
+  _describe -t formulas 'formulas' formulas
+}
+"#
+                    .replace("{exe_path}", &exe_path)
+                );
+            }
+            _ => {
+                print!("{}", script);
+            }
+        }
         return Ok(());
     }
 
@@ -405,7 +493,19 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
     match cli.command {
         Commands::Init => unreachable!(),              // Handled above
         Commands::Completion { .. } => unreachable!(), // Handled above
-        Commands::Install { formula, no_link, cask } => {
+        Commands::InternalCompletionList => {
+            // Need to create installer/tap manager to access listing
+            let items = installer.tap_manager.list_available_items();
+            for item in items {
+                println!("{}", item);
+            }
+            return Ok(());
+        }
+        Commands::Install {
+            formula,
+            no_link,
+            cask,
+        } => {
             let start = Instant::now();
 
             // Set up progress display
@@ -428,81 +528,82 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             let done_style = ProgressStyle::default_spinner()
                 .template("    {prefix:<16} {msg}")
                 .unwrap();
-                
+
             let bars_clone = bars.clone();
             let multi_clone = multi.clone();
             let download_style_clone = download_style.clone();
             let spinner_style_clone = spinner_style.clone();
             let done_style_clone = done_style.clone();
 
-            let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> = Arc::new(move |event| {
-                let mut bars = bars_clone.lock().unwrap();
-                match event {
-                    InstallProgress::DownloadStarted { name, total_bytes } => {
-                        let pb = if let Some(total) = total_bytes {
-                            let pb = multi_clone.add(ProgressBar::new(total));
-                            pb.set_style(download_style_clone.clone());
-                            pb
-                        } else {
-                            let pb = multi_clone.add(ProgressBar::new_spinner());
-                            pb.set_style(spinner_style_clone.clone());
-                            pb.set_message("downloading...");
-                            pb.enable_steady_tick(std::time::Duration::from_millis(80));
-                            pb
-                        };
-                        pb.set_prefix(name.clone());
-                        bars.insert(name, pb);
-                    }
-                    InstallProgress::DownloadProgress {
-                        name,
-                        downloaded,
-                        total_bytes,
-                    } => {
-                        if let Some(pb) = bars.get(&name)
-                            && total_bytes.is_some()
-                        {
-                            pb.set_position(downloaded);
+            let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> =
+                Arc::new(move |event| {
+                    let mut bars = bars_clone.lock().unwrap();
+                    match event {
+                        InstallProgress::DownloadStarted { name, total_bytes } => {
+                            let pb = if let Some(total) = total_bytes {
+                                let pb = multi_clone.add(ProgressBar::new(total));
+                                pb.set_style(download_style_clone.clone());
+                                pb
+                            } else {
+                                let pb = multi_clone.add(ProgressBar::new_spinner());
+                                pb.set_style(spinner_style_clone.clone());
+                                pb.set_message("downloading...");
+                                pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                pb
+                            };
+                            pb.set_prefix(name.clone());
+                            bars.insert(name, pb);
                         }
-                    }
-                    InstallProgress::DownloadCompleted { name, total_bytes } => {
-                        if let Some(pb) = bars.get(&name) {
-                            if total_bytes > 0 {
-                                pb.set_position(total_bytes);
+                        InstallProgress::DownloadProgress {
+                            name,
+                            downloaded,
+                            total_bytes,
+                        } => {
+                            if let Some(pb) = bars.get(&name)
+                                && total_bytes.is_some()
+                            {
+                                pb.set_position(downloaded);
                             }
-                            pb.set_style(spinner_style_clone.clone());
-                            pb.set_message("unpacking...");
-                            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                        }
+                        InstallProgress::DownloadCompleted { name, total_bytes } => {
+                            if let Some(pb) = bars.get(&name) {
+                                if total_bytes > 0 {
+                                    pb.set_position(total_bytes);
+                                }
+                                pb.set_style(spinner_style_clone.clone());
+                                pb.set_message("unpacking...");
+                                pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                            }
+                        }
+                        InstallProgress::UnpackStarted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("unpacking...");
+                            }
+                        }
+                        InstallProgress::UnpackCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("unpacked");
+                            }
+                        }
+                        InstallProgress::LinkStarted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("linking...");
+                            }
+                        }
+                        InstallProgress::LinkCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("linked");
+                            }
+                        }
+                        InstallProgress::InstallCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_style(done_style_clone.clone());
+                                pb.set_message(format!("{} installed", style("✓").green()));
+                                pb.finish();
+                            }
                         }
                     }
-                    InstallProgress::UnpackStarted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("unpacking...");
-                        }
-                    }
-                    InstallProgress::UnpackCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("unpacked");
-                        }
-                    }
-                    InstallProgress::LinkStarted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("linking...");
-                        }
-                    }
-                    InstallProgress::LinkCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("linked");
-                        }
-                    }
-                    InstallProgress::InstallCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_style(done_style_clone.clone());
-                            pb.set_message(format!("{} installed", style("✓").green()));
-                            pb.finish();
-                        }
-                    }
-                }
-            });
+                });
 
             if cask {
                 println!(
@@ -510,9 +611,11 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                     style("==>").cyan().bold(),
                     style(&formula).bold()
                 );
-                
-                let result = installer.install_cask(&formula, Some(progress_callback)).await;
-                
+
+                let result = installer
+                    .install_cask(&formula, Some(progress_callback))
+                    .await;
+
                 // Cleanup
                 {
                     let bars = bars.lock().unwrap();
@@ -522,8 +625,8 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                         }
                     }
                 }
-                
-                let _ = result?;
+
+                result?;
 
                 let elapsed = start.elapsed();
                 println!();
@@ -623,7 +726,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                 }
             };
 
-            let plan = match installer.plan(&normalized).await {
+            let _plan = match installer.plan(&normalized).await {
                 Ok(p) => p,
                 Err(e) => {
                     suggest_homebrew(&formula, &e);
@@ -651,81 +754,82 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             let done_style = ProgressStyle::default_spinner()
                 .template("    {prefix:<16} {msg}")
                 .unwrap();
-                
+
             let bars_clone = bars.clone();
             let multi_clone = multi.clone();
             let download_style_clone = download_style.clone();
             let spinner_style_clone = spinner_style.clone();
             let done_style_clone = done_style.clone();
 
-            let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> = Arc::new(move |event| {
-                let mut bars = bars_clone.lock().unwrap();
-                match event {
-                    InstallProgress::DownloadStarted { name, total_bytes } => {
-                        let pb = if let Some(total) = total_bytes {
-                            let pb = multi_clone.add(ProgressBar::new(total));
-                            pb.set_style(download_style_clone.clone());
-                            pb
-                        } else {
-                            let pb = multi_clone.add(ProgressBar::new_spinner());
-                            pb.set_style(spinner_style_clone.clone());
-                            pb.set_message("downloading...");
-                            pb.enable_steady_tick(std::time::Duration::from_millis(80));
-                            pb
-                        };
-                        pb.set_prefix(name.clone());
-                        bars.insert(name, pb);
-                    }
-                    InstallProgress::DownloadProgress {
-                        name,
-                        downloaded,
-                        total_bytes,
-                    } => {
-                        if let Some(pb) = bars.get(&name)
-                            && total_bytes.is_some()
-                        {
-                            pb.set_position(downloaded);
+            let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> =
+                Arc::new(move |event| {
+                    let mut bars = bars_clone.lock().unwrap();
+                    match event {
+                        InstallProgress::DownloadStarted { name, total_bytes } => {
+                            let pb = if let Some(total) = total_bytes {
+                                let pb = multi_clone.add(ProgressBar::new(total));
+                                pb.set_style(download_style_clone.clone());
+                                pb
+                            } else {
+                                let pb = multi_clone.add(ProgressBar::new_spinner());
+                                pb.set_style(spinner_style_clone.clone());
+                                pb.set_message("downloading...");
+                                pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                pb
+                            };
+                            pb.set_prefix(name.clone());
+                            bars.insert(name, pb);
                         }
-                    }
-                    InstallProgress::DownloadCompleted { name, total_bytes } => {
-                        if let Some(pb) = bars.get(&name) {
-                            if total_bytes > 0 {
-                                pb.set_position(total_bytes);
+                        InstallProgress::DownloadProgress {
+                            name,
+                            downloaded,
+                            total_bytes,
+                        } => {
+                            if let Some(pb) = bars.get(&name)
+                                && total_bytes.is_some()
+                            {
+                                pb.set_position(downloaded);
                             }
-                            pb.set_style(spinner_style_clone.clone());
-                            pb.set_message("unpacking...");
-                            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                        }
+                        InstallProgress::DownloadCompleted { name, total_bytes } => {
+                            if let Some(pb) = bars.get(&name) {
+                                if total_bytes > 0 {
+                                    pb.set_position(total_bytes);
+                                }
+                                pb.set_style(spinner_style_clone.clone());
+                                pb.set_message("unpacking...");
+                                pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                            }
+                        }
+                        InstallProgress::UnpackStarted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("unpacking...");
+                            }
+                        }
+                        InstallProgress::UnpackCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("unpacked");
+                            }
+                        }
+                        InstallProgress::LinkStarted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("linking...");
+                            }
+                        }
+                        InstallProgress::LinkCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_message("linked");
+                            }
+                        }
+                        InstallProgress::InstallCompleted { name } => {
+                            if let Some(pb) = bars.get(&name) {
+                                pb.set_style(done_style_clone.clone());
+                                pb.set_message(format!("{} installed", style("✓").green()));
+                                pb.finish();
+                            }
                         }
                     }
-                    InstallProgress::UnpackStarted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("unpacking...");
-                        }
-                    }
-                    InstallProgress::UnpackCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("unpacked");
-                        }
-                    }
-                    InstallProgress::LinkStarted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("linking...");
-                        }
-                    }
-                    InstallProgress::LinkCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_message("linked");
-                        }
-                    }
-                    InstallProgress::InstallCompleted { name } => {
-                        if let Some(pb) = bars.get(&name) {
-                            pb.set_style(done_style_clone.clone());
-                            pb.set_message(format!("{} installed", style("✓").green()));
-                            pb.finish();
-                        }
-                    }
-                }
-            });
+                });
 
             if cask {
                 println!(
@@ -733,9 +837,11 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                     style("==>").cyan().bold(),
                     style(&formula).bold()
                 );
-                
-                let result = installer.install_cask(&formula, Some(progress_callback)).await;
-                
+
+                let result = installer
+                    .install_cask(&formula, Some(progress_callback))
+                    .await;
+
                 // Cleanup
                 {
                     let bars = bars.lock().unwrap();
@@ -745,8 +851,8 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                         }
                     }
                 }
-                
-                let _ = result?;
+
+                result?;
 
                 let elapsed = start.elapsed();
                 println!();
@@ -804,7 +910,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             // So we need Arc<Box<dyn Fn...>>
             // But we created Arc<dyn Fn...>
             // We should create a closure that calls our shared Arc<dyn Fn>
-            
+
             let shared_cb = progress_callback.clone();
             let formula_cb: Arc<ProgressCallback> = Arc::new(Box::new(move |event| {
                 shared_cb(event);
