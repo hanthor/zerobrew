@@ -110,6 +110,111 @@ impl ApiClient {
 
         Ok(formula)
     }
+
+    /// Fetch a cask from the Homebrew API
+    /// Returns (url, sha256, version, name, artifacts) for the current platform
+    pub async fn get_cask(
+        &self,
+        name: &str,
+    ) -> Result<(String, String, String, String, Vec<String>), Error> {
+        let url = format!("https://formulae.brew.sh/api/cask/{}.json", name);
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::NetworkFailure {
+                message: e.to_string(),
+            })?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::MissingFormula {
+                name: name.to_string(),
+            });
+        }
+
+        if !response.status().is_success() {
+            return Err(Error::NetworkFailure {
+                message: format!("HTTP {}", response.status()),
+            });
+        }
+
+        let body = response.text().await.map_err(|e| Error::NetworkFailure {
+            message: format!("failed to read response body: {e}"),
+        })?;
+
+        // Parse cask JSON
+        #[derive(serde::Deserialize)]
+        struct Variation {
+            url: String,
+            sha256: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CaskJson {
+            token: String,
+            version: String,
+            url: Option<String>,
+            sha256: Option<String>,
+            artifacts: Vec<serde_json::Value>,
+            variations: Option<std::collections::HashMap<String, Variation>>,
+        }
+
+        let cask: CaskJson = serde_json::from_str(&body).map_err(|e| Error::NetworkFailure {
+            message: format!("failed to parse cask JSON: {e}"),
+        })?;
+
+        // Determine platform key
+        let platform_key = if cfg!(target_arch = "aarch64") {
+            "arm64_linux"
+        } else {
+            "x86_64_linux"
+        };
+
+        // Try to get platform-specific variation first
+        let (download_url, sha256) = if let Some(variations) = &cask.variations {
+            if let Some(variation) = variations.get(platform_key) {
+                (variation.url.clone(), variation.sha256.clone())
+            } else {
+                // Fall back to default
+                (
+                    cask.url.ok_or_else(|| Error::MissingFormula {
+                        name: format!("{} (no Linux URL)", name),
+                    })?,
+                    cask.sha256.ok_or_else(|| Error::MissingFormula {
+                        name: format!("{} (no sha256)", name),
+                    })?,
+                )
+            }
+        } else {
+            (
+                cask.url.ok_or_else(|| Error::MissingFormula {
+                    name: format!("{} (no URL)", name),
+                })?,
+                cask.sha256.ok_or_else(|| Error::MissingFormula {
+                    name: format!("{} (no sha256)", name),
+                })?,
+            )
+        };
+
+        // Extract binary artifacts
+        let mut binaries = Vec::new();
+        for artifact in &cask.artifacts {
+            if let Some(obj) = artifact.as_object()
+                && let Some(binary) = obj.get("binary")
+                && let Some(arr) = binary.as_array()
+            {
+                for b in arr {
+                    if let Some(s) = b.as_str() {
+                        binaries.push(s.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok((download_url, sha256, cask.version, cask.token, binaries))
+    }
     pub async fn get_all_formula_names(&self) -> Result<Vec<String>, Error> {
         self.fetch_names_from_list(
             "https://formulae.brew.sh/api/formula.json",

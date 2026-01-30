@@ -73,12 +73,12 @@ impl Installer {
     }
 
     /// Resolve dependencies and plan the install
-    pub async fn plan(&self, name: &str) -> Result<InstallPlan, Error> {
+    pub async fn plan(&self, names: &[String]) -> Result<InstallPlan, Error> {
         // Recursively fetch all formulas we need
-        let formulas = self.fetch_all_formulas(name).await?;
+        let formulas = self.fetch_all_formulas(names).await?;
 
         // Resolve in topological order
-        let ordered = resolve_closure(name, &formulas)?;
+        let ordered = resolve_closure(names, &formulas)?;
 
         // Build list of formulas in order
         let all_formulas: Vec<Formula> = ordered
@@ -97,6 +97,19 @@ impl Installer {
             formulas: all_formulas,
             bottles,
         })
+    }
+
+    pub async fn install(&mut self, name: &str, link: bool) -> Result<ExecuteResult, Error> {
+        self.install_many(&[name.to_string()], link).await
+    }
+
+    pub async fn install_many(
+        &mut self,
+        names: &[String],
+        link: bool,
+    ) -> Result<ExecuteResult, Error> {
+        let plan = self.plan(names).await?;
+        self.execute_with_progress(plan, link, None).await
     }
 
     /// Try to extract a download, with automatic retry on corruption
@@ -167,13 +180,16 @@ impl Installer {
         }))
     }
 
-    /// Recursively fetch a formula and all its dependencies in parallel batches
-    async fn fetch_all_formulas(&self, name: &str) -> Result<BTreeMap<String, Formula>, Error> {
+    /// Recursively fetch formulas and all their dependencies in parallel batches
+    async fn fetch_all_formulas(
+        &self,
+        names: &[String],
+    ) -> Result<BTreeMap<String, Formula>, Error> {
         use std::collections::HashSet;
 
         let mut formulas = BTreeMap::new();
         let mut fetched: HashSet<String> = HashSet::new();
-        let mut to_fetch: Vec<String> = vec![name.to_string()];
+        let mut to_fetch: Vec<String> = names.to_vec();
 
         while !to_fetch.is_empty() {
             // Fetch current batch in parallel
@@ -183,7 +199,7 @@ impl Installer {
                 .collect();
 
             if batch.is_empty() {
-                break;
+                continue;
             }
 
             // Mark as fetched before starting (to avoid re-queueing)
@@ -191,26 +207,48 @@ impl Installer {
                 fetched.insert(n.clone());
             }
 
-            // Fetch all in parallel
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|n| self.api_client.get_formula(n))
-                .collect();
+            // Separate tap formulas from core formulas
+            let (tap_formulas, core_formulas): (Vec<_>, Vec<_>) =
+                batch.iter().partition(|n| n.contains('/'));
 
-            let results = futures::future::join_all(futures).await;
-
-            // Process results and queue new dependencies
-            for (i, result) in results.into_iter().enumerate() {
-                let formula = result?;
-
-                // Queue dependencies for next batch
-                for dep in &formula.dependencies {
-                    if !fetched.contains(dep) && !to_fetch.contains(dep) {
-                        to_fetch.push(dep.clone());
+            // Fetch tap formulas synchronously (they're local)
+            for name in tap_formulas {
+                match self.tap_manager.resolve_formula(name) {
+                    Ok(formula) => {
+                        // Queue dependencies for next batch
+                        for dep in &formula.dependencies {
+                            if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                                to_fetch.push(dep.clone());
+                            }
+                        }
+                        formulas.insert(name.clone(), formula);
                     }
+                    Err(e) => return Err(e),
                 }
+            }
 
-                formulas.insert(batch[i].clone(), formula);
+            // Fetch core formulas from API in parallel
+            if !core_formulas.is_empty() {
+                let futures: Vec<_> = core_formulas
+                    .iter()
+                    .map(|n| self.api_client.get_formula(n))
+                    .collect();
+
+                let results = futures::future::join_all(futures).await;
+
+                // Process results and queue new dependencies
+                for (i, result) in results.into_iter().enumerate() {
+                    let formula = result?;
+
+                    // Queue dependencies for next batch
+                    for dep in &formula.dependencies {
+                        if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                            to_fetch.push(dep.clone());
+                        }
+                    }
+
+                    formulas.insert(core_formulas[i].clone(), formula);
+                }
             }
         }
 
@@ -381,12 +419,6 @@ impl Installer {
         })
     }
 
-    /// Convenience method to plan and execute in one call
-    pub async fn install(&mut self, name: &str, link: bool) -> Result<ExecuteResult, Error> {
-        let plan = self.plan(name).await?;
-        self.execute(plan, link).await
-    }
-
     /// Uninstall a formula
     pub fn uninstall(&mut self, name: &str) -> Result<(), Error> {
         // Check if installed
@@ -425,7 +457,8 @@ impl Installer {
     }
 
     /// Ensure a tap is installed
-    pub fn tap(&self, user: &str, repo: &str) -> Result<PathBuf, Error> {
+    /// Returns (path, TapResult) where TapResult indicates if it was cloned or already existed
+    pub fn tap(&self, user: &str, repo: &str) -> Result<(PathBuf, crate::tap::TapResult), Error> {
         self.tap_manager.ensure_tap(user, repo)
     }
 
@@ -475,6 +508,120 @@ impl Installer {
         name: &str,
         progress: Option<Arc<dyn Fn(InstallProgress) + Send + Sync>>,
     ) -> Result<(), Error> {
+        // For core casks (no '/'), try API first
+        // For tap casks (has '/'), use tap resolution
+        let (url, sha256, version, cask_name, binaries) = if !name.contains('/') {
+            // Try to fetch from Homebrew API
+            match self.api_client.get_cask(name).await {
+                Ok((url, sha256, version, token, binaries)) => {
+                    (url, sha256, version, token, binaries)
+                }
+                Err(_) => {
+                    // Fall back to tap resolution
+                    return self.install_cask_from_tap(name, progress).await;
+                }
+            }
+        } else {
+            // Tap cask - use tap resolution
+            return self.install_cask_from_tap(name, progress).await;
+        };
+
+        // Download artifact
+        let request = DownloadRequest {
+            url: url.clone(),
+            sha256: sha256.clone(),
+            name: cask_name.clone(),
+        };
+
+        let blob_path = self
+            .downloader
+            .download_single(request, progress.clone())
+            .await?;
+
+        // Check if this is an archive or a raw binary
+        let is_archive = Store::is_likely_archive(&blob_path);
+
+        // Determine the primary binary name (first in list, or the cask name)
+        let primary_binary = binaries.first().map(|s| s.as_str()).unwrap_or(&cask_name);
+
+        // Ensure entry in store
+        let store_entry = if is_archive {
+            self.store.ensure_entry(&sha256, &blob_path)?
+        } else {
+            // Raw binary file - store it with the binary name
+            self.store
+                .ensure_entry_binary(&sha256, &blob_path, primary_binary)?
+        };
+
+        if let Some(cb) = &progress {
+            cb(InstallProgress::UnpackStarted {
+                name: cask_name.clone(),
+            });
+        }
+
+        // Prepare Caskroom directory
+        let caskroom = self
+            .store
+            .root()
+            .join("Caskroom")
+            .join(&cask_name)
+            .join(&version);
+        if caskroom.exists() {
+            std::fs::remove_dir_all(&caskroom).map_err(|e| Error::StoreCorruption {
+                message: format!("Failed to remove existing caskroom dir: {}", e),
+            })?;
+        }
+        let caskroom_parent = caskroom.parent().unwrap();
+        std::fs::create_dir_all(caskroom_parent).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to create caskroom parent: {}", e),
+        })?;
+
+        // Link store entry to caskroom
+        symlink(&store_entry, &caskroom).map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to symlink store entry to caskroom: {}", e),
+        })?;
+
+        if let Some(cb) = &progress {
+            cb(InstallProgress::UnpackCompleted {
+                name: cask_name.clone(),
+            });
+            cb(InstallProgress::LinkStarted {
+                name: cask_name.clone(),
+            });
+        }
+
+        // Link binaries from API artifacts
+        for bin_name in &binaries {
+            let source = caskroom.join(bin_name);
+            if source.exists() {
+                let target = self.linker.prefix().join("bin").join(bin_name);
+                if target.exists() {
+                    std::fs::remove_file(&target).ok();
+                }
+                symlink(&source, &target).map_err(|e| Error::StoreCorruption {
+                    message: format!("Failed to symlink binary: {}", e),
+                })?;
+            } else {
+                eprintln!("Warning: Binary {} not found in cask", bin_name);
+            }
+        }
+
+        if let Some(cb) = &progress {
+            cb(InstallProgress::LinkCompleted {
+                name: cask_name.clone(),
+            });
+            cb(InstallProgress::InstallCompleted { name: cask_name });
+        }
+
+        Ok(())
+    }
+
+    /// Install a cask from a tap (original implementation)
+    async fn install_cask_from_tap(
+        &self,
+        name: &str,
+        progress: Option<Arc<dyn Fn(InstallProgress) + Send + Sync>>,
+    ) -> Result<(), Error> {
         let (path, cask_name) = self.tap_manager.resolve_cask(name)?;
         let content = std::fs::read_to_string(&path).map_err(|e| Error::StoreCorruption {
             message: format!("Failed to read cask file {}: {}", path.display(), e),
@@ -508,8 +655,32 @@ impl Installer {
             .download_single(request, progress.clone())
             .await?;
 
+        // Check if this is an archive or a raw binary (AppImage, RPM, etc.)
+        let is_archive = Store::is_likely_archive(&blob_path);
+
+        // Get a binary name for non-archive files from artifacts
+        let binary_name = cask
+            .artifacts
+            .iter()
+            .find_map(|a| {
+                if let zb_core::cask::Artifact::Binary(path) = a {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| cask_name.clone());
+
         // Ensure entry in store (verify checksum)
-        let store_entry = self.store.ensure_entry(&sha256, &blob_path)?;
+        let store_entry = if is_archive {
+            self.store.ensure_entry(&sha256, &blob_path)?
+        } else {
+            // Raw binary file (AppImage, RPM, etc.)
+            self.store
+                .ensure_entry_binary(&sha256, &blob_path, &binary_name)?
+        };
 
         if let Some(cb) = &progress {
             cb(InstallProgress::UnpackStarted {

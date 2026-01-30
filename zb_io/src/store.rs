@@ -99,6 +99,110 @@ impl Store {
         Ok(entry_path)
     }
 
+    /// Like ensure_entry but for raw binary files (not archives).
+    /// Copies the binary file directly to the store as-is.
+    pub fn ensure_entry_binary(
+        &self,
+        store_key: &str,
+        blob_path: &Path,
+        binary_name: &str,
+    ) -> Result<PathBuf, Error> {
+        let entry_path = self.entry_path(store_key);
+
+        // Fast path: already exists
+        if entry_path.exists() {
+            return Ok(entry_path);
+        }
+
+        // Acquire exclusive lock for this store_key
+        let lock_path = self.locks_dir.join(format!("{store_key}.lock"));
+        let lock_file = File::create(&lock_path).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to create lock file: {e}"),
+        })?;
+
+        lock_file
+            .lock_exclusive()
+            .map_err(|e| Error::StoreCorruption {
+                message: format!("failed to acquire lock: {e}"),
+            })?;
+
+        // Double-check after acquiring lock
+        if entry_path.exists() {
+            return Ok(entry_path);
+        }
+
+        // Create the entry directory with the binary inside
+        fs::create_dir_all(&entry_path).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to create entry directory: {e}"),
+        })?;
+
+        // Copy the binary file into the entry
+        let dest_path = entry_path.join(binary_name);
+        fs::copy(blob_path, &dest_path).map_err(|e| Error::StoreCorruption {
+            message: format!("failed to copy binary file: {e}"),
+        })?;
+
+        // Make it executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&dest_path)
+                .map_err(|e| Error::StoreCorruption {
+                    message: format!("failed to get metadata: {e}"),
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&dest_path, perms).map_err(|e| Error::StoreCorruption {
+                message: format!("failed to set permissions: {e}"),
+            })?;
+        }
+
+        Ok(entry_path)
+    }
+
+    /// Check if a file looks like an archive (gzip/tar/zip/zstd/rpm/appimage) based on magic bytes
+    pub fn is_likely_archive(path: &Path) -> bool {
+        if let Ok(mut file) = File::open(path) {
+            let mut magic = [0u8; 12]; // Need 12 bytes for AppImage check
+            if io::Read::read(&mut file, &mut magic).is_ok() {
+                // gzip magic
+                if magic[0] == 0x1f && magic[1] == 0x8b {
+                    return true;
+                }
+                // zip magic
+                if magic[0] == 0x50 && magic[1] == 0x4b {
+                    return true;
+                }
+                // xz magic
+                if magic[0] == 0xfd && magic[1] == 0x37 && magic[2] == 0x7a {
+                    return true;
+                }
+                // zstd magic (28 b5 2f fd)
+                if magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd {
+                    return true;
+                }
+                // rpm magic (ed ab ee db)
+                if magic[0] == 0xed && magic[1] == 0xab && magic[2] == 0xee && magic[3] == 0xdb {
+                    return true;
+                }
+                // AppImage magic (ELF + AI\x02 at offset 8)
+                // ELF magic: 7f 45 4c 46
+                // AppImage magic: 41 49 02 at offset 8
+                if magic[0] == 0x7f
+                    && magic[1] == 0x45
+                    && magic[2] == 0x4c
+                    && magic[3] == 0x46
+                    && magic[8] == 0x41
+                    && magic[9] == 0x49
+                    && magic[10] == 0x02
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Remove a store entry. This should only be called when the refcount is 0.
     pub fn remove_entry(&self, store_key: &str) -> Result<(), Error> {
         let entry_path = self.entry_path(store_key);

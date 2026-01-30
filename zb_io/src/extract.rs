@@ -10,73 +10,98 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 use zb_core::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CompressionFormat {
+enum PackageFormat {
     Gzip,
     Xz,
     Zstd,
+    Rpm,
+    AppImage,
     Unknown,
 }
 
-fn detect_compression(path: &Path) -> Result<CompressionFormat, Error> {
+fn detect_format(path: &Path) -> Result<PackageFormat, Error> {
     let mut file = File::open(path).map_err(|e| Error::StoreCorruption {
-        message: format!("failed to open tarball: {e}"),
+        message: format!("failed to open package: {e}"),
     })?;
 
-    let mut magic = [0u8; 6];
+    let mut magic = [0u8; 12];
     let bytes_read = file.read(&mut magic).map_err(|e| Error::StoreCorruption {
         message: format!("failed to read magic bytes: {e}"),
     })?;
 
     if bytes_read < 2 {
-        return Ok(CompressionFormat::Unknown);
+        return Ok(PackageFormat::Unknown);
     }
 
     // Gzip: 1f 8b
     if magic[0] == 0x1f && magic[1] == 0x8b {
-        return Ok(CompressionFormat::Gzip);
+        return Ok(PackageFormat::Gzip);
     }
 
-    // XZ: fd 37 7a 58 5a 00 (FD 7zXZ\0)
+    // XZ: fd 37 7a 58 5a 00
     if bytes_read >= 6 && magic[0..6] == [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] {
-        return Ok(CompressionFormat::Xz);
+        return Ok(PackageFormat::Xz);
     }
 
     // Zstd: 28 b5 2f fd
     if bytes_read >= 4 && magic[0..4] == [0x28, 0xb5, 0x2f, 0xfd] {
-        return Ok(CompressionFormat::Zstd);
+        return Ok(PackageFormat::Zstd);
     }
 
-    Ok(CompressionFormat::Unknown)
+    // RPM: ed ab ee db
+    if bytes_read >= 4 && magic[0..4] == [0xed, 0xab, 0xee, 0xdb] {
+        return Ok(PackageFormat::Rpm);
+    }
+
+    // AppImage (ELF + AI\x02): 7f 45 4c 46 ... [8] 41 49 02
+    if bytes_read >= 11
+        && magic[0..4] == [0x7f, 0x45, 0x4c, 0x46]
+        && magic[8] == 0x41
+        && magic[9] == 0x49
+        && magic[10] == 0x02
+    {
+        return Ok(PackageFormat::AppImage);
+    }
+
+    Ok(PackageFormat::Unknown)
 }
 
-pub fn extract_tarball(tarball_path: &Path, dest_dir: &Path) -> Result<(), Error> {
-    let format = detect_compression(tarball_path)?;
+pub fn extract_tarball(path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    let format = detect_format(path)?;
 
-    let file = File::open(tarball_path).map_err(|e| Error::StoreCorruption {
+    // Handle non-tarball formats
+    match format {
+        PackageFormat::Rpm => return extract_rpm(path, dest_dir),
+        PackageFormat::AppImage => return extract_appimage(path, dest_dir),
+        _ => {}
+    }
+
+    let file = File::open(path).map_err(|e| Error::StoreCorruption {
         message: format!("failed to open tarball: {e}"),
     })?;
     let reader = BufReader::new(file);
 
     match format {
-        CompressionFormat::Gzip => {
+        PackageFormat::Gzip => {
             let decoder = GzDecoder::new(reader);
             extract_tar_archive(decoder, dest_dir)
         }
-        CompressionFormat::Xz => {
+        PackageFormat::Xz => {
             let decoder = XzDecoder::new(reader);
             extract_tar_archive(decoder, dest_dir)
         }
-        CompressionFormat::Zstd => {
+        PackageFormat::Zstd => {
             let decoder = ZstdDecoder::new(reader).map_err(|e| Error::StoreCorruption {
                 message: format!("failed to create zstd decoder: {e}"),
             })?;
             extract_tar_archive(decoder, dest_dir)
         }
-        CompressionFormat::Unknown => {
+        PackageFormat::Unknown => {
             // Try gzip as fallback
             let decoder = GzDecoder::new(reader);
             extract_tar_archive(decoder, dest_dir)
         }
+        _ => unreachable!(),
     }
 }
 
@@ -108,6 +133,70 @@ fn extract_tar_archive<R: Read>(reader: R, dest_dir: &Path) -> Result<(), Error>
             .map_err(|e| Error::StoreCorruption {
                 message: format!("failed to unpack entry {path_display}: {e}"),
             })?;
+    }
+
+    Ok(())
+}
+
+/// Extract an RPM package using rpm2cpio and cpio
+pub fn extract_rpm(rpm_path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    // rpm2cpio path/to.rpm | cpio -idm --quiet
+    let rpm2cpio = std::process::Command::new("rpm2cpio")
+        .arg(rpm_path)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to spawn rpm2cpio: {}", e),
+        })?;
+
+    let status = std::process::Command::new("cpio")
+        .args(["-idm", "--quiet"])
+        .current_dir(dest_dir)
+        .stdin(rpm2cpio.stdout.unwrap())
+        .status()
+        .map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to run cpio: {}", e),
+        })?;
+
+    if !status.success() {
+        return Err(Error::StoreCorruption {
+            message: format!("cpio extraction failed with status: {}", status),
+        });
+    }
+
+    Ok(())
+}
+
+/// Extract an AppImage using --appimage-extract
+pub fn extract_appimage(appimage_path: &Path, dest_dir: &Path) -> Result<(), Error> {
+    // Make executable
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(appimage_path)
+        .map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to read metadata: {}", e),
+        })?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(appimage_path, perms).map_err(|e| Error::StoreCorruption {
+        message: format!("Failed to make AppImage executable: {}", e),
+    })?;
+
+    // Run with --appimage-extract
+    // AppImage extracts to squashfs-root in the current directory
+    let status = std::process::Command::new(appimage_path)
+        .arg("--appimage-extract")
+        .current_dir(dest_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| Error::StoreCorruption {
+            message: format!("Failed to run AppImage extract: {}", e),
+        })?;
+
+    if !status.success() {
+        return Err(Error::StoreCorruption {
+            message: format!("AppImage extraction failed with status: {}", status),
+        });
     }
 
     Ok(())

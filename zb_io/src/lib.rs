@@ -26,3 +26,4 @@ pub use link::Linker;
 pub use materialize::Cellar;
 pub use progress::{InstallProgress, ProgressCallback};
 pub use store::Store;
+pub use tap::TapResult;
