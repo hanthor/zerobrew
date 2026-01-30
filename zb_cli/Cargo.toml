@@ -17,6 +17,7 @@ console.workspace = true
 
 zb_core = { path = "../zb_core" }
 zb_io = { path = "../zb_io" }
+futures.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

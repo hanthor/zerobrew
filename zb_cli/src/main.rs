@@ -9,6 +9,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use zb_io::bundle::BundleParser;
 use zb_io::install::create_installer;
 use zb_io::{InstallProgress, ProgressCallback};
 
@@ -89,6 +90,13 @@ enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::shells::Shell,
+    },
+
+    /// Install dependencies from a Brewfile
+    Bundle {
+        /// Path to Brewfile
+        #[arg(long, default_value = "Brewfile")]
+        file: PathBuf,
     },
 
     /// Internal command for dynamic completion listing
@@ -337,6 +345,7 @@ fn ensure_init(root: &Path, prefix: &Path) -> Result<(), zb_core::Error> {
 fn normalize_formula_name(name: &str) -> Result<String, zb_core::Error> {
     let trimmed = name.trim();
     if let Some((tap, formula)) = trimmed.rsplit_once('/') {
+        // For homebrew/core, strip the tap prefix
         if tap == "homebrew/core" {
             if formula.is_empty() {
                 return Err(zb_core::Error::MissingFormula {
@@ -345,9 +354,13 @@ fn normalize_formula_name(name: &str) -> Result<String, zb_core::Error> {
             }
             return Ok(formula.to_string());
         }
-        return Err(zb_core::Error::UnsupportedTap {
-            name: trimmed.to_string(),
-        });
+        // For other taps, return the full tap/formula name
+        if formula.is_empty() {
+            return Err(zb_core::Error::MissingFormula {
+                name: trimmed.to_string(),
+            });
+        }
+        return Ok(trimmed.to_string());
     }
 
     Ok(trimmed.to_string())
@@ -663,7 +676,7 @@ _zb_dynamic_formulas() {
                 };
 
                 // Try to plan as formula first
-                let plan_result = installer.plan(&normalized).await;
+                let plan_result = installer.plan(std::slice::from_ref(&normalized)).await;
 
                 // Fallback logic: If missing formula, try generic failure (which might be Cask)
                 // Actually, installer.plan returns MissingFormula if not found.
@@ -929,6 +942,558 @@ _zb_dynamic_formulas() {
                 "{} Reset complete. Ready for cold install.",
                 style("==>").cyan().bold()
             );
+        }
+
+        Commands::Bundle { file } => {
+            if !file.exists() {
+                return Err(zb_core::Error::StoreCorruption {
+                    message: format!("Brewfile not found at {}", file.display()),
+                });
+            }
+
+            println!("{} Parsing Brewfile...", style("==>").cyan().bold());
+            let bundle = BundleParser::parse_file(&file)?;
+
+            // Taps - parallel cloning with progress UI
+            if !bundle.taps.is_empty() {
+                println!(
+                    "{} Tapping {} repositories...",
+                    style("==>").cyan().bold(),
+                    bundle.taps.len()
+                );
+
+                // Set up MultiProgress for tap spinners
+                let tap_multi = MultiProgress::new();
+                let tap_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<20} {spinner} {msg}")
+                    .unwrap();
+                let tap_done_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<20} {msg}")
+                    .unwrap();
+
+                // Parse taps and create spinners
+                let mut tap_tasks = Vec::new();
+                let mut tap_bars = Vec::new();
+
+                for tap in &bundle.taps {
+                    if let Some((user, repo)) = tap.split_once('/') {
+                        let pb = tap_multi.add(ProgressBar::new_spinner());
+                        pb.set_style(tap_style.clone());
+                        pb.set_prefix(tap.clone());
+                        pb.set_message("cloning...");
+                        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                        tap_bars.push((tap.clone(), pb));
+                        tap_tasks.push((user.to_string(), repo.to_string(), tap.clone()));
+                    } else {
+                        eprintln!(
+                            "{} Skipping invalid tap format: {}",
+                            style("Warning:").yellow().bold(),
+                            tap
+                        );
+                    }
+                }
+
+                // Clone all taps in parallel using thread::scope
+                // Use TapManager directly since Installer is not Sync
+                let tap_manager = zb_io::tap::TapManager::new(root.clone());
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = tap_tasks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (user, repo, _tap_name))| {
+                            let tap_bars = &tap_bars;
+                            let tap_done_style = &tap_done_style;
+                            let tap_manager = &tap_manager;
+                            s.spawn(move || {
+                                let result = tap_manager.ensure_tap(user, repo);
+                                // Update UI immediately when done
+                                if let Some((_name, pb)) = tap_bars.get(i) {
+                                    match &result {
+                                        Ok((_, tap_result)) => {
+                                            pb.set_style(tap_done_style.clone());
+                                            match tap_result {
+                                                zb_io::TapResult::Cloned => {
+                                                    pb.set_message(format!(
+                                                        "{}",
+                                                        style("✓ cloned").green()
+                                                    ));
+                                                }
+                                                zb_io::TapResult::Existed => {
+                                                    pb.set_message(format!(
+                                                        "{}",
+                                                        style("✓ already tapped").dim()
+                                                    ));
+                                                }
+                                            }
+                                            pb.finish();
+                                        }
+                                        Err(e) => {
+                                            pb.set_style(tap_done_style.clone());
+                                            pb.set_message(format!(
+                                                "{} {}",
+                                                style("✗ failed:").red(),
+                                                e
+                                            ));
+                                            pb.finish();
+                                        }
+                                    }
+                                }
+                                result
+                            })
+                        })
+                        .collect();
+
+                    // Wait for all threads to complete
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                });
+            }
+
+            // Brews
+            if !bundle.brews.is_empty() {
+                println!(
+                    "{} Installing {} formulas...",
+                    style("==>").cyan().bold(),
+                    bundle.brews.len()
+                );
+
+                let mut normalized_brews = Vec::new();
+                for brew in &bundle.brews {
+                    match normalize_formula_name(brew) {
+                        Ok(name) => normalized_brews.push(name),
+                        Err(e) => {
+                            eprintln!(
+                                "{} Failed to normalize {}: {}",
+                                style("error:").red().bold(),
+                                brew,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                // Set up progress display
+                let multi = MultiProgress::new();
+                let bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+
+                let download_style = ProgressStyle::default_bar()
+                    .template(
+                        "    {prefix:<16} {bar:25.cyan/dim} {bytes:>10}/{total_bytes:<10} {eta:>6}",
+                    )
+                    .unwrap()
+                    .progress_chars("━━╸");
+
+                let spinner_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<16} {spinner} {msg}")
+                    .unwrap();
+
+                let done_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<16} {msg}")
+                    .unwrap();
+
+                let bars_clone = bars.clone();
+                let multi_clone = multi.clone();
+                let download_style_clone = download_style.clone();
+                let spinner_style_clone = spinner_style.clone();
+                let done_style_clone = done_style.clone();
+
+                let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> =
+                    Arc::new(move |event| {
+                        let mut bars = bars_clone.lock().unwrap();
+                        match event {
+                            InstallProgress::DownloadStarted { name, total_bytes } => {
+                                let pb = if let Some(total) = total_bytes {
+                                    let pb = multi_clone.add(ProgressBar::new(total));
+                                    pb.set_style(download_style_clone.clone());
+                                    pb
+                                } else {
+                                    let pb = multi_clone.add(ProgressBar::new_spinner());
+                                    pb.set_style(spinner_style_clone.clone());
+                                    pb.set_message("downloading...");
+                                    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                    pb
+                                };
+                                pb.set_prefix(name.clone());
+                                bars.insert(name, pb);
+                            }
+                            InstallProgress::DownloadProgress {
+                                name,
+                                downloaded,
+                                total_bytes,
+                            } => {
+                                if let Some(pb) = bars.get(&name)
+                                    && total_bytes.is_some()
+                                {
+                                    pb.set_position(downloaded);
+                                }
+                            }
+                            InstallProgress::DownloadCompleted { name, total_bytes } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    if total_bytes > 0 {
+                                        pb.set_position(total_bytes);
+                                    }
+                                    pb.set_style(spinner_style_clone.clone());
+                                    pb.set_message("unpacking...");
+                                    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                }
+                            }
+                            InstallProgress::UnpackStarted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("unpacking...");
+                                }
+                            }
+                            InstallProgress::UnpackCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("unpacked");
+                                }
+                            }
+                            InstallProgress::LinkStarted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("linking...");
+                                }
+                            }
+                            InstallProgress::LinkCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("linked");
+                                }
+                            }
+                            InstallProgress::InstallCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_style(done_style_clone.clone());
+                                    pb.set_message(format!("{} installed", style("✓").green()));
+                                    pb.finish();
+                                }
+                            }
+                        }
+                    });
+
+                // Plan all formulas together for parallel installation
+                let formula_cb: Arc<ProgressCallback> = Arc::new(Box::new({
+                    let progress_callback = progress_callback.clone();
+                    move |event| {
+                        progress_callback(event);
+                    }
+                }));
+
+                // Try to plan all formulas at once
+                let plan_result = installer.plan(&normalized_brews).await;
+
+                match plan_result {
+                    Ok(plan) => {
+                        let formula_count = plan.formulas.len();
+                        match installer
+                            .execute_with_progress(plan, true, Some(formula_cb))
+                            .await
+                        {
+                            Ok(_) => {
+                                println!(
+                                    "{} Installed {} formulas",
+                                    style("✓").green(),
+                                    formula_count
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "{} Failed to install formulas: {}",
+                                    style("error:").red().bold(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Batch planning failed - try formulas individually to find which work
+                        let mut valid_formulas = Vec::new();
+                        let mut failed_formulas = Vec::new();
+
+                        for name in &normalized_brews {
+                            match installer.plan(std::slice::from_ref(name)).await {
+                                Ok(_) => valid_formulas.push(name.clone()),
+                                Err(e) => {
+                                    eprintln!(
+                                        "{} Skipping {}: {}",
+                                        style("Warning:").yellow().bold(),
+                                        name,
+                                        e
+                                    );
+                                    failed_formulas.push(name.clone());
+                                }
+                            }
+                        }
+
+                        // Install the valid formulas in parallel
+                        if !valid_formulas.is_empty() {
+                            match installer.plan(&valid_formulas).await {
+                                Ok(plan) => {
+                                    let formula_count = plan.formulas.len();
+                                    match installer
+                                        .execute_with_progress(plan, true, Some(formula_cb))
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            println!(
+                                                "{} Installed {} formulas",
+                                                style("✓").green(),
+                                                formula_count
+                                            );
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "{} Failed to install formulas: {}",
+                                                style("error:").red().bold(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{} Failed to plan formulas: {}",
+                                        style("error:").red().bold(),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+
+                        if !failed_formulas.is_empty() {
+                            eprintln!(
+                                "{} Skipped {} unavailable formulas",
+                                style("Warning:").yellow().bold(),
+                                failed_formulas.len()
+                            );
+                        }
+                    }
+                }
+
+                // Cleanup progress bars
+                {
+                    let bars = bars.lock().unwrap();
+                    for (_, pb) in bars.iter() {
+                        if !pb.is_finished() {
+                            pb.finish();
+                        }
+                    }
+                }
+                println!();
+            }
+
+            // Casks
+            if !bundle.casks.is_empty() {
+                println!(
+                    "{} Installing {} casks...",
+                    style("==>").cyan().bold(),
+                    bundle.casks.len()
+                );
+
+                // Set up progress display for casks
+                let multi = MultiProgress::new();
+                let bars: Arc<Mutex<HashMap<String, ProgressBar>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+
+                let download_style = ProgressStyle::default_bar()
+                    .template(
+                        "    {prefix:<16} {bar:25.cyan/dim} {bytes:>10}/{total_bytes:<10} {eta:>6}",
+                    )
+                    .unwrap()
+                    .progress_chars("━━╸");
+
+                let spinner_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<16} {spinner} {msg}")
+                    .unwrap();
+
+                let done_style = ProgressStyle::default_spinner()
+                    .template("    {prefix:<16} {msg}")
+                    .unwrap();
+
+                let bars_clone = bars.clone();
+                let multi_clone = multi.clone();
+                let download_style_clone = download_style.clone();
+                let spinner_style_clone = spinner_style.clone();
+                let done_style_clone = done_style.clone();
+
+                let progress_callback: Arc<dyn Fn(InstallProgress) + Send + Sync> =
+                    Arc::new(move |event| {
+                        let mut bars = bars_clone.lock().unwrap();
+                        match event {
+                            InstallProgress::DownloadStarted { name, total_bytes } => {
+                                let pb = if let Some(total) = total_bytes {
+                                    let pb = multi_clone.add(ProgressBar::new(total));
+                                    pb.set_style(download_style_clone.clone());
+                                    pb
+                                } else {
+                                    let pb = multi_clone.add(ProgressBar::new_spinner());
+                                    pb.set_style(spinner_style_clone.clone());
+                                    pb.set_message("downloading...");
+                                    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                    pb
+                                };
+                                pb.set_prefix(name.clone());
+                                bars.insert(name, pb);
+                            }
+                            InstallProgress::DownloadProgress {
+                                name,
+                                downloaded,
+                                total_bytes,
+                            } => {
+                                if let Some(pb) = bars.get(&name)
+                                    && total_bytes.is_some()
+                                {
+                                    pb.set_position(downloaded);
+                                }
+                            }
+                            InstallProgress::DownloadCompleted { name, total_bytes } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    if total_bytes > 0 {
+                                        pb.set_position(total_bytes);
+                                    }
+                                    pb.set_style(spinner_style_clone.clone());
+                                    pb.set_message("unpacking...");
+                                    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+                                }
+                            }
+                            InstallProgress::UnpackStarted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("unpacking...");
+                                }
+                            }
+                            InstallProgress::UnpackCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("unpacked");
+                                }
+                            }
+                            InstallProgress::LinkStarted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("linking...");
+                                }
+                            }
+                            InstallProgress::LinkCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_message("linked");
+                                }
+                            }
+                            InstallProgress::InstallCompleted { name } => {
+                                if let Some(pb) = bars.get(&name) {
+                                    pb.set_style(done_style_clone.clone());
+                                    pb.set_message(format!("{} installed", style("✓").green()));
+                                    pb.finish();
+                                }
+                            }
+                        }
+                    });
+
+                // Install casks in parallel
+                let cask_futures: Vec<_> = bundle
+                    .casks
+                    .iter()
+                    .map(|cask| {
+                        let cask = cask.clone();
+                        let progress_callback = progress_callback.clone();
+                        let installer = &installer;
+                        async move {
+                            let result =
+                                installer.install_cask(&cask, Some(progress_callback)).await;
+                            (cask, result)
+                        }
+                    })
+                    .collect();
+
+                let results = futures::future::join_all(cask_futures).await;
+
+                let mut installed = Vec::new();
+                let mut failed = Vec::new();
+
+                for (cask, result) in results {
+                    match result {
+                        Ok(_) => installed.push(cask),
+                        Err(e) => {
+                            eprintln!(
+                                "{} Failed to install cask {}: {}",
+                                style("error:").red().bold(),
+                                cask,
+                                e
+                            );
+                            failed.push((cask, e));
+                        }
+                    }
+                }
+
+                // Cleanup progress bars
+                {
+                    let bars = bars.lock().unwrap();
+                    for (_, pb) in bars.iter() {
+                        if !pb.is_finished() {
+                            pb.finish();
+                        }
+                    }
+                }
+                println!();
+
+                if !installed.is_empty() {
+                    println!("{} Installed {} casks", style("✓").green(), installed.len());
+                }
+
+                if !failed.is_empty() {
+                    eprintln!(
+                        "{} Failed to install {} casks",
+                        style("Warning:").yellow().bold(),
+                        failed.len()
+                    );
+                }
+            }
+
+            // Flatpaks
+            if !bundle.flatpaks.is_empty() {
+                if cfg!(target_os = "linux") {
+                    // Check if flatpak is installed
+                    if std::process::Command::new("flatpak")
+                        .arg("--version")
+                        .output()
+                        .is_ok()
+                    {
+                        println!(
+                            "{} Installing {} flatpaks...",
+                            style("==>").cyan().bold(),
+                            bundle.flatpaks.len()
+                        );
+
+                        let mut args = vec!["install", "-y", "--noninteractive", "--system"];
+                        args.extend(bundle.flatpaks.iter().map(|s| s.as_str()));
+
+                        println!(
+                            "    {} Installing flatpaks: {}",
+                            style("→").cyan(),
+                            bundle.flatpaks.join(", ")
+                        );
+                        let status = std::process::Command::new("flatpak").args(&args).status();
+
+                        match status {
+                            Ok(s) if s.success() => {
+                                println!("    {} Installed flatpaks", style("✓").green())
+                            }
+                            _ => eprintln!(
+                                "    {} Failed to install flatpaks",
+                                style("error:").red().bold()
+                            ),
+                        }
+                    } else {
+                        println!(
+                            "{} flatpak not found, skipping {} applications...",
+                            style("Warning:").yellow().bold(),
+                            bundle.flatpaks.len()
+                        );
+                    }
+                } else {
+                    println!(
+                        "{} Flatpaks are only supported on Linux, skipping...",
+                        style("Note:").yellow().bold()
+                    );
+                }
+            }
+
+            println!("{} Bundle complete!", style("==>").cyan().bold());
         }
     }
 
