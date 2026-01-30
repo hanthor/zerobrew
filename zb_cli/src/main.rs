@@ -1,7 +1,9 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::generate;
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -16,12 +18,12 @@ use zb_io::{InstallProgress, ProgressCallback};
 #[command(version)]
 struct Cli {
     /// Root directory for zerobrew data
-    #[arg(long, default_value = "/opt/zerobrew")]
-    root: PathBuf,
+    #[arg(long, env = "ZEROBREW_ROOT")]
+    root: Option<PathBuf>,
 
     /// Prefix directory for linked binaries
-    #[arg(long, default_value = "/opt/zerobrew/prefix")]
-    prefix: PathBuf,
+    #[arg(long, env = "ZEROBREW_PREFIX")]
+    prefix: Option<PathBuf>,
 
     /// Number of parallel downloads
     #[arg(long, default_value = "48")]
@@ -49,6 +51,16 @@ enum Commands {
         formula: Option<String>,
     },
 
+    /// Migrate all installed Homebrew packages to zerobrew
+    Migrate {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Use --force when uninstalling from Homebrew (removes all versions)
+        #[arg(long)]
+        force: bool,
+    },
+
     /// List installed formulas
     List,
 
@@ -70,6 +82,25 @@ enum Commands {
 
     /// Initialize zerobrew directories with correct permissions
     Init,
+
+    /// Generate shell completion scripts
+    Completion {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::shells::Shell,
+    },
+
+    /// Manage taps
+    Tap {
+        /// Tap name to add (e.g., homebrew/core)
+        name: Option<String>,
+    },
+
+    /// Remove a tap
+    Untap {
+        /// Tap name to remove
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -229,22 +260,34 @@ fn add_to_path(prefix: &Path) -> Result<(), String> {
     if !already_added {
         // Append to config
         let addition = format!("\n# zerobrew\n{}\n", path_export);
-        std::fs::OpenOptions::new()
+
+        let write_result = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&config_file)
-            .and_then(|mut f| {
-                use std::io::Write;
-                f.write_all(addition.as_bytes())
-            })
-            .map_err(|e| format!("Failed to update {}: {}", config_file, e))?;
+            .and_then(|mut f| f.write_all(addition.as_bytes()));
 
-        println!(
-            "    {} Added {} to PATH in {}",
-            style("✓").green(),
-            bin_path.display(),
-            config_file
-        );
+        if let Err(e) = write_result {
+            println!(
+                "{} Could not write to {} due to error: {}",
+                style("Warning:").yellow().bold(),
+                config_file,
+                e
+            );
+            println!(
+                "{} Please add the following line to {}:",
+                style("Info:").cyan().bold(),
+                config_file
+            );
+            println!("{}", addition);
+        } else {
+            println!(
+                "    {} Added {} to PATH in {}",
+                style("✓").green(),
+                bin_path.display(),
+                config_file
+            );
+        }
     }
 
     // Always check if PATH is actually set in current shell
@@ -276,7 +319,6 @@ fn ensure_init(root: &Path, prefix: &Path) -> Result<(), zb_core::Error> {
     println!();
 
     print!("Initialize now? [Y/n] ");
-    use std::io::{self, Write};
     io::stdout().flush().unwrap();
 
     let mut input = String::new();
@@ -290,6 +332,24 @@ fn ensure_init(root: &Path, prefix: &Path) -> Result<(), zb_core::Error> {
     }
 
     run_init(root, prefix).map_err(|e| zb_core::Error::StoreCorruption { message: e })
+}
+
+fn normalize_formula_name(name: &str) -> Result<String, zb_core::Error> {
+    let trimmed = name.trim();
+    if let Some((tap, formula)) = trimmed.split_once('/') {
+        if formula.contains('/') {
+            // Likely user/repo/formula
+            return Ok(trimmed.to_string());
+        }
+        if tap == "homebrew" && formula == "core" {
+            // homebrew/core -> just core
+             return Ok(trimmed.to_string());
+        }
+        // Might be a tap formula or just homebrew/core/name (handled by installer)
+        return Ok(trimmed.to_string());
+    }
+
+    Ok(trimmed.to_string())
 }
 
 fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
@@ -309,9 +369,47 @@ fn suggest_homebrew(formula: &str, error: &zb_core::Error) {
 }
 
 async fn run(cli: Cli) -> Result<(), zb_core::Error> {
+    // Handle completion first - it doesn't need the installer
+    if let Commands::Completion { shell } = cli.command {
+        let mut cmd = Cli::command();
+        generate(shell, &mut cmd, "zb", &mut io::stdout());
+        return Ok(());
+    }
+
+    let root = cli.root.unwrap_or_else(|| {
+        // Check ZEROBREW_ROOT env var first
+        if let Ok(env_root) = std::env::var("ZEROBREW_ROOT") {
+            return PathBuf::from(env_root);
+        }
+
+        // Check for legacy /opt/zerobrew
+        let legacy_root = PathBuf::from("/opt/zerobrew");
+        if legacy_root.exists() {
+            return legacy_root;
+        }
+
+        // macOS: /opt/zerobrew
+        // Linux: ~/.local/share/zerobrew (XDG_DATA_HOME)
+        if cfg!(target_os = "macos") {
+            legacy_root
+        } else {
+            let xdg_data_home = std::env::var("XDG_DATA_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::var("HOME")
+                        .map(|h| PathBuf::from(h).join(".local").join("share"))
+                        .unwrap_or_else(|_| legacy_root.clone())
+                });
+            xdg_data_home.join("zerobrew")
+        }
+    });
+
+    let prefix = cli.prefix.unwrap_or_else(|| root.join("prefix"));
+
     // Handle init separately - it doesn't need the installer
     if matches!(cli.command, Commands::Init) {
-        return run_init(&cli.root, &cli.prefix)
+        return run_init(&root, &prefix)
             .map_err(|e| zb_core::Error::StoreCorruption { message: e });
     }
 
@@ -320,13 +418,58 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         // Skip init check for reset
     } else {
         // Ensure initialized before other commands
-        ensure_init(&cli.root, &cli.prefix)?;
+        ensure_init(&root, &prefix)?;
     }
 
-    let mut installer = create_installer(&cli.root, &cli.prefix, cli.concurrency)?;
+    let mut installer = create_installer(&root, &prefix, cli.concurrency)?;
 
     match cli.command {
-        Commands::Init => unreachable!(), // Handled above
+        Commands::Init => unreachable!(),              // Handled above
+        Commands::Completion { .. } => unreachable!(), // Handled above
+        
+        Commands::Tap { name } => {
+            if let Some(name) = name {
+                println!(
+                    "{} Tapping {}...",
+                    style("==>").cyan().bold(),
+                    style(&name).bold()
+                );
+                let (user, repo) = name.split_once('/').ok_or_else(|| zb_core::Error::ParseError {
+                    message: "Invalid tap name, expected user/repo".to_string(),
+                })?;
+                
+                // create_installer already has tap_manager
+                // But we can just use the installer's tap manager if we add a method
+                // Or use TapManager directly
+                let tap_manager = zb_io::tap::TapManager::new(root);
+                tap_manager.ensure_tap(user, repo)?;
+                println!("{} Tapped {}", style("✓").green(), name);
+            } else {
+                let tap_manager = zb_io::tap::TapManager::new(root);
+                let taps = tap_manager.list_taps();
+                if taps.is_empty() {
+                    println!("No taps installed.");
+                } else {
+                    for tap in taps {
+                        println!("{}", tap);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        Commands::Untap { name } => {
+            println!(
+                "{} Untapping {}...",
+                style("==>").cyan().bold(),
+                style(&name).bold()
+            );
+            let tap_manager = zb_io::tap::TapManager::new(root);
+            tap_manager.untap(&name)?;
+            println!("{} Untapped {}", style("✓").green(), name);
+            return Ok(());
+        }
+
         Commands::Install { formula, no_link } => {
             let start = Instant::now();
             println!(
@@ -335,7 +478,15 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                 style(&formula).bold()
             );
 
-            let plan = match installer.plan(&formula).await {
+            let normalized = match normalize_formula_name(&formula) {
+                Ok(name) => name,
+                Err(e) => {
+                    suggest_homebrew(&formula, &e);
+                    return Err(e);
+                }
+            };
+
+            let plan = match installer.plan(&[normalized]).await {
                 Ok(p) => p,
                 Err(e) => {
                     suggest_homebrew(&formula, &e);
@@ -527,6 +678,242 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             }
         },
 
+        Commands::Migrate { yes, force } => {
+            println!(
+                "{} Fetching installed Homebrew packages...",
+                style("==>").cyan().bold()
+            );
+
+            let packages = match zb_io::get_homebrew_packages() {
+                Ok(pkgs) => pkgs,
+                Err(e) => {
+                    return Err(zb_core::Error::StoreCorruption {
+                        message: format!("Failed to get Homebrew packages: {}", e),
+                    });
+                }
+            };
+
+            if packages.formulas.is_empty()
+                && packages.non_core_formulas.is_empty()
+                && packages.casks.is_empty()
+            {
+                println!("No Homebrew packages installed.");
+                return Ok(());
+            }
+
+            println!(
+                "    {} core formulas, {} non-core formulas, {} casks found",
+                style(packages.formulas.len()).green(),
+                style(packages.non_core_formulas.len()).yellow(),
+                style(packages.casks.len()).green()
+            );
+            println!();
+
+            // Show non-core formulas that can't be migrated
+            if !packages.non_core_formulas.is_empty() {
+                println!(
+                    "{} Formulas from non-core taps cannot be migrated to zerobrew:",
+                    style("Note:").yellow().bold()
+                );
+                for pkg in &packages.non_core_formulas {
+                    println!("    • {} ({})", pkg.name, pkg.tap);
+                }
+                println!();
+            }
+
+            // Show casks that can't be migrated
+            if !packages.casks.is_empty() {
+                println!(
+                    "{} Casks cannot be migrated to zerobrew (only CLI formulas are supported):",
+                    style("Note:").yellow().bold()
+                );
+                for cask in &packages.casks {
+                    println!("    • {}", cask.name);
+                }
+                println!();
+            }
+
+            if packages.formulas.is_empty() {
+                println!("No core formulas to migrate.");
+                return Ok(());
+            }
+
+            println!(
+                "The following {} formulas will be migrated:",
+                packages.formulas.len()
+            );
+            for pkg in &packages.formulas {
+                println!("    • {}", pkg.name);
+            }
+            println!();
+
+            if !yes {
+                print!("Continue with migration? [y/N] ");
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            println!();
+            println!(
+                "{} Migrating {} formulas to zerobrew...",
+                style("==>").cyan().bold(),
+                style(packages.formulas.len()).green().bold()
+            );
+
+            let mut success_count = 0;
+            let mut failed: Vec<String> = Vec::new();
+
+            for pkg in &packages.formulas {
+                print!("    {} {}...", style("○").dim(), pkg.name);
+
+                match installer.plan(&[pkg.name.clone()]).await {
+                    Ok(plan) => {
+                        // Execute the plan without progress bars for batch migration
+                        match installer.execute(plan, true).await {
+                            Ok(_) => {
+                                println!(" {}", style("✓").green());
+                                success_count += 1;
+                            }
+                            Err(e) => {
+                                println!(" {}", style("✗").red());
+                                eprintln!(
+                                    "      {} Failed to install: {}",
+                                    style("error:").red().bold(),
+                                    e
+                                );
+                                failed.push(pkg.name.clone());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!(" {}", style("✗").red());
+                        eprintln!(
+                            "      {} Failed to plan: {}",
+                            style("error:").red().bold(),
+                            e
+                        );
+                        failed.push(pkg.name.clone());
+                    }
+                }
+            }
+
+            println!();
+            println!(
+                "{} Migrated {} of {} formulas to zerobrew",
+                style("==>").cyan().bold(),
+                style(success_count).green().bold(),
+                packages.formulas.len()
+            );
+
+            if !failed.is_empty() {
+                println!(
+                    "{} Failed to migrate {} formula(s):",
+                    style("Warning:").yellow().bold(),
+                    failed.len()
+                );
+                for name in &failed {
+                    println!("    • {}", name);
+                }
+                println!();
+            }
+
+            if success_count == 0 {
+                println!(
+                    "No formulas were successfully migrated. Skipping uninstall from Homebrew."
+                );
+                return Ok(());
+            }
+
+            // Ask for confirmation to uninstall from Homebrew
+            println!();
+            if !yes {
+                print!(
+                    "Uninstall {} formula(s) from Homebrew? [y/N] ",
+                    style(success_count).green()
+                );
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap();
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Skipped uninstall from Homebrew.");
+                    return Ok(());
+                }
+            }
+
+            println!();
+            println!(
+                "{} Uninstalling from Homebrew...",
+                style("==>").cyan().bold()
+            );
+
+            let mut uninstalled = 0;
+            let mut uninstall_failed: Vec<String> = Vec::new();
+
+            for pkg in &packages.formulas {
+                // Skip if it failed to install in zerobrew
+                if failed.contains(&pkg.name) {
+                    continue;
+                }
+
+                print!("    {} {}...", style("○").dim(), pkg.name);
+
+                let mut args = vec!["uninstall"];
+                if force {
+                    args.push("--force");
+                }
+                args.push(&pkg.name);
+
+                let status = Command::new("brew")
+                    .args(&args)
+                    .status()
+                    .map_err(|e| format!("Failed to run brew uninstall: {}", e));
+
+                match status {
+                    Ok(s) if s.success() => {
+                        println!(" {}", style("✓").green());
+                        uninstalled += 1;
+                    }
+                    Ok(_) => {
+                        println!(" {}", style("✗").red());
+                        uninstall_failed.push(pkg.name.clone());
+                    }
+                    Err(e) => {
+                        println!(" {}", style("✗").red());
+                        eprintln!("      {}: {}", style("error:").red().bold(), e);
+                        uninstall_failed.push(pkg.name.clone());
+                    }
+                }
+            }
+
+            println!();
+            println!(
+                "{} Uninstalled {} of {} formula(s) from Homebrew",
+                style("==>").cyan().bold(),
+                style(uninstalled).green().bold(),
+                success_count
+            );
+
+            if !uninstall_failed.is_empty() {
+                println!(
+                    "{} Failed to uninstall {} formula(s) from Homebrew:",
+                    style("Warning:").yellow().bold(),
+                    uninstall_failed.len()
+                );
+                for name in &uninstall_failed {
+                    println!("    • {}", name);
+                }
+                println!("You may need to uninstall these manually with:");
+                println!("    brew uninstall --force <formula>");
+            }
+        }
+
         Commands::List => {
             let installed = installer.list_installed()?;
 
@@ -576,7 +963,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
         }
 
         Commands::Reset { yes } => {
-            if !cli.root.exists() && !cli.prefix.exists() {
+            if !root.exists() && !prefix.exists() {
                 println!("Nothing to reset - directories do not exist.");
                 return Ok(());
             }
@@ -586,10 +973,9 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
                     "{} This will delete all zerobrew data at:",
                     style("Warning:").yellow().bold()
                 );
-                println!("      • {}", cli.root.display());
-                println!("      • {}", cli.prefix.display());
+                println!("      • {}", root.display());
+                println!("      • {}", prefix.display());
                 print!("Continue? [y/N] ");
-                use std::io::{self, Write};
                 io::stdout().flush().unwrap();
 
                 let mut input = String::new();
@@ -601,7 +987,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             }
 
             // Remove directories - try without sudo first, then with
-            for dir in [&cli.root, &cli.prefix] {
+            for dir in [&root, &prefix] {
                 if !dir.exists() {
                     continue;
                 }
@@ -630,8 +1016,7 @@ async fn run(cli: Cli) -> Result<(), zb_core::Error> {
             }
 
             // Re-initialize with correct permissions
-            run_init(&cli.root, &cli.prefix)
-                .map_err(|e| zb_core::Error::StoreCorruption { message: e })?;
+            run_init(&root, &prefix).map_err(|e| zb_core::Error::StoreCorruption { message: e })?;
 
             println!(
                 "{} Reset complete. Ready for cold install.",

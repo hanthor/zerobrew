@@ -13,6 +13,7 @@ use crate::materialize::Cellar;
 use crate::progress::{InstallProgress, ProgressCallback};
 use crate::store::Store;
 
+use crate::tap::TapManager;
 use zb_core::{Error, Formula, SelectedBottle, resolve_closure, select_bottle};
 
 /// Maximum number of retries for corrupted downloads
@@ -25,6 +26,7 @@ pub struct Installer {
     cellar: Cellar,
     linker: Linker,
     db: Database,
+    tap_manager: TapManager,
 }
 
 pub struct InstallPlan {
@@ -53,6 +55,7 @@ impl Installer {
         cellar: Cellar,
         linker: Linker,
         db: Database,
+        tap_manager: TapManager,
         download_concurrency: usize,
     ) -> Self {
         Self {
@@ -62,16 +65,17 @@ impl Installer {
             cellar,
             linker,
             db,
+            tap_manager,
         }
     }
 
     /// Resolve dependencies and plan the install
-    pub async fn plan(&self, name: &str) -> Result<InstallPlan, Error> {
+    pub async fn plan(&self, names: &[String]) -> Result<InstallPlan, Error> {
         // Recursively fetch all formulas we need
-        let formulas = self.fetch_all_formulas(name).await?;
+        let formulas = self.fetch_all_formulas(names).await?;
 
         // Resolve in topological order
-        let ordered = resolve_closure(name, &formulas)?;
+        let ordered = resolve_closure(names, &formulas)?;
 
         // Build list of formulas in order
         let all_formulas: Vec<Formula> = ordered
@@ -160,13 +164,16 @@ impl Installer {
         }))
     }
 
-    /// Recursively fetch a formula and all its dependencies in parallel batches
-    async fn fetch_all_formulas(&self, name: &str) -> Result<BTreeMap<String, Formula>, Error> {
+    /// Recursively fetch formulas and all their dependencies in parallel batches
+    async fn fetch_all_formulas(
+        &self,
+        names: &[String],
+    ) -> Result<BTreeMap<String, Formula>, Error> {
         use std::collections::HashSet;
 
         let mut formulas = BTreeMap::new();
         let mut fetched: HashSet<String> = HashSet::new();
-        let mut to_fetch: Vec<String> = vec![name.to_string()];
+        let mut to_fetch: Vec<String> = names.to_vec();
 
         while !to_fetch.is_empty() {
             // Fetch current batch in parallel
@@ -176,7 +183,7 @@ impl Installer {
                 .collect();
 
             if batch.is_empty() {
-                break;
+                continue;
             }
 
             // Mark as fetched before starting (to avoid re-queueing)
@@ -184,26 +191,60 @@ impl Installer {
                 fetched.insert(n.clone());
             }
 
-            // Fetch all in parallel
-            let futures: Vec<_> = batch
-                .iter()
-                .map(|n| self.api_client.get_formula(n))
-                .collect();
+            // Marks names that were not found in taps and need API fetching
+            let mut core_to_fetch = Vec::new();
 
-            let results = futures::future::join_all(futures).await;
-
-            // Process results and queue new dependencies
-            for (i, result) in results.into_iter().enumerate() {
-                let formula = result?;
-
-                // Queue dependencies for next batch
-                for dep in &formula.dependencies {
-                    if !fetched.contains(dep) && !to_fetch.contains(dep) {
-                        to_fetch.push(dep.clone());
+            for name in batch {
+                if name.contains('/') {
+                    // Fully qualified tap formula
+                    match self.tap_manager.resolve_formula(&name) {
+                        Ok(formula) => {
+                            for dep in &formula.dependencies {
+                                if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                                    to_fetch.push(dep.clone());
+                                }
+                            }
+                            formulas.insert(name, formula);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    // Short name - try taps first, then fallback to API
+                    if let Some(formula) = self.tap_manager.find_formula(&name) {
+                        for dep in &formula.dependencies {
+                            if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                                to_fetch.push(dep.clone());
+                            }
+                        }
+                        formulas.insert(name, formula);
+                    } else {
+                        core_to_fetch.push(name);
                     }
                 }
+            }
 
-                formulas.insert(batch[i].clone(), formula);
+            // Fetch core formulas from API in parallel
+            if !core_to_fetch.is_empty() {
+                let futures: Vec<_> = core_to_fetch
+                    .iter()
+                    .map(|n| self.api_client.get_formula(n))
+                    .collect();
+
+                let results = futures::future::join_all(futures).await;
+
+                // Process results and queue new dependencies
+                for (i, result) in results.into_iter().enumerate() {
+                    let formula = result?;
+                    let name = &core_to_fetch[i];
+
+                    // Queue dependencies for next batch
+                    for dep in &formula.dependencies {
+                        if !fetched.contains(dep) && !to_fetch.contains(dep) {
+                            to_fetch.push(dep.clone());
+                        }
+                    }
+                    formulas.insert(name.clone(), formula);
+                }
             }
         }
 
@@ -376,7 +417,11 @@ impl Installer {
 
     /// Convenience method to plan and execute in one call
     pub async fn install(&mut self, name: &str, link: bool) -> Result<ExecuteResult, Error> {
-        let plan = self.plan(name).await?;
+        self.install_many(&[name.to_string()], link).await
+    }
+
+    pub async fn install_many(&mut self, names: &[String], link: bool) -> Result<ExecuteResult, Error> {
+        let plan = self.plan(names).await?;
         self.execute(plan, link).await
     }
 
@@ -482,6 +527,7 @@ pub fn create_installer(
         message: format!("failed to create linker: {e}"),
     })?;
     let db = Database::open(&root.join("db/zb.sqlite3"))?;
+    let tap_manager = TapManager::new(root.to_path_buf());
 
     Ok(Installer::new(
         api_client,
@@ -490,6 +536,7 @@ pub fn create_installer(
         cellar,
         linker,
         db,
+        tap_manager,
         download_concurrency,
     ))
 }
@@ -536,6 +583,14 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
+    fn get_test_bottle_tag() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "x86_64_linux"
+        } else {
+            "arm64_sonoma"
+        }
+    }
+
     #[tokio::test]
     async fn install_completes_successfully() {
         let mock_server = MockServer::start().await;
@@ -546,6 +601,7 @@ mod tests {
         let bottle_sha = sha256_hex(&bottle);
 
         // Create formula JSON
+        let tag = get_test_bottle_tag();
         let formula_json = format!(
             r#"{{
                 "name": "testpkg",
@@ -554,15 +610,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/testpkg-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/testpkg-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             bottle_sha
         );
 
@@ -575,7 +633,10 @@ mod tests {
 
         // Mount bottle download mock
         Mock::given(method("GET"))
-            .and(path("/bottles/testpkg-1.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!(
+                "/bottles/testpkg-1.0.0.{}.bottle.tar.gz",
+                tag
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle.clone()))
             .mount(&mock_server)
             .await;
@@ -592,7 +653,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install
         installer.install("testpkg", true).await.unwrap();
@@ -619,6 +690,7 @@ mod tests {
         let bottle_sha = sha256_hex(&bottle);
 
         // Create formula JSON
+        let tag = get_test_bottle_tag();
         let formula_json = format!(
             r#"{{
                 "name": "uninstallme",
@@ -627,15 +699,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/uninstallme-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/uninstallme-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             bottle_sha
         );
 
@@ -647,9 +721,10 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path(
-                "/bottles/uninstallme-1.0.0.arm64_sonoma.bottle.tar.gz",
-            ))
+            .and(path(format!(
+                "/bottles/uninstallme-1.0.0.{}.bottle.tar.gz",
+                tag
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle.clone()))
             .mount(&mock_server)
             .await;
@@ -666,7 +741,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install
         installer.install("uninstallme", true).await.unwrap();
@@ -695,6 +780,7 @@ mod tests {
         let bottle_sha = sha256_hex(&bottle);
 
         // Create formula JSON
+        let tag = get_test_bottle_tag();
         let formula_json = format!(
             r#"{{
                 "name": "gctest",
@@ -703,15 +789,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/gctest-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/gctest-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             bottle_sha
         );
 
@@ -723,7 +811,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/bottles/gctest-1.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!("/bottles/gctest-1.0.0.{}.bottle.tar.gz", tag)))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle.clone()))
             .mount(&mock_server)
             .await;
@@ -740,7 +828,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install and uninstall
         installer.install("gctest", true).await.unwrap();
@@ -772,6 +870,7 @@ mod tests {
         let bottle_sha = sha256_hex(&bottle);
 
         // Create formula JSON
+        let tag = get_test_bottle_tag();
         let formula_json = format!(
             r#"{{
                 "name": "keepme",
@@ -780,15 +879,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/keepme-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/keepme-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             bottle_sha
         );
 
@@ -800,7 +901,7 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/bottles/keepme-1.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!("/bottles/keepme-1.0.0.{}.bottle.tar.gz", tag)))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(bottle.clone()))
             .mount(&mock_server)
             .await;
@@ -817,7 +918,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install but don't uninstall
         installer.install("keepme", true).await.unwrap();
@@ -846,6 +957,7 @@ mod tests {
         let main_sha = sha256_hex(&main_bottle);
 
         // Create formula JSONs
+        let tag = get_test_bottle_tag();
         let dep_json = format!(
             r#"{{
                 "name": "deplib",
@@ -854,15 +966,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/deplib-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/deplib-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             dep_sha
         );
 
@@ -874,15 +988,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/mainpkg-2.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/mainpkg-2.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             main_sha
         );
 
@@ -900,13 +1016,16 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/bottles/deplib-1.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!("/bottles/deplib-1.0.0.{}.bottle.tar.gz", tag)))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(dep_bottle))
             .mount(&mock_server)
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/bottles/mainpkg-2.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!(
+                "/bottles/mainpkg-2.0.0.{}.bottle.tar.gz",
+                tag
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(main_bottle))
             .mount(&mock_server)
             .await;
@@ -923,7 +1042,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install main package (should also install dependency)
         installer.install("mainpkg", true).await.unwrap();
@@ -955,28 +1084,34 @@ mod tests {
         let root_sha = sha256_hex(&root_bottle);
 
         // Formula JSONs
+        let tag = get_test_bottle_tag();
         let leaf1_json = format!(
-            r#"{{"name":"leaf1","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/leaf1.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"leaf1","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/leaf1.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             leaf1_sha
         );
         let leaf2_json = format!(
-            r#"{{"name":"leaf2","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/leaf2.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"leaf2","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/leaf2.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             leaf2_sha
         );
         let mid1_json = format!(
-            r#"{{"name":"mid1","versions":{{"stable":"1.0.0"}},"dependencies":["leaf1"],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/mid1.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"mid1","versions":{{"stable":"1.0.0"}},"dependencies":["leaf1"],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/mid1.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             mid1_sha
         );
         let mid2_json = format!(
-            r#"{{"name":"mid2","versions":{{"stable":"1.0.0"}},"dependencies":["leaf1","leaf2"],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/mid2.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"mid2","versions":{{"stable":"1.0.0"}},"dependencies":["leaf1","leaf2"],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/mid2.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             mid2_sha
         );
         let root_json = format!(
-            r#"{{"name":"root","versions":{{"stable":"1.0.0"}},"dependencies":["mid1","mid2"],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/root.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"root","versions":{{"stable":"1.0.0"}},"dependencies":["mid1","mid2"],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/root.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             root_sha
         );
@@ -1020,7 +1155,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install root (should install all 5 packages)
         installer.install("root", true).await.unwrap();
@@ -1049,15 +1194,18 @@ mod tests {
         let slow_sha = sha256_hex(&slow_bottle);
 
         // Fast package formula
+        let tag = get_test_bottle_tag();
         let fast_json = format!(
-            r#"{{"name":"fastpkg","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/fast.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"fastpkg","versions":{{"stable":"1.0.0"}},"dependencies":[],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/fast.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             fast_sha
         );
 
         // Slow package formula (depends on fast)
         let slow_json = format!(
-            r#"{{"name":"slowpkg","versions":{{"stable":"1.0.0"}},"dependencies":["fastpkg"],"bottle":{{"stable":{{"files":{{"arm64_sonoma":{{"url":"{}/bottles/slow.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            r#"{{"name":"slowpkg","versions":{{"stable":"1.0.0"}},"dependencies":["fastpkg"],"bottle":{{"stable":{{"files":{{"{}":{{"url":"{}/bottles/slow.tar.gz","sha256":"{}"}}}}}}}}}}"#,
+            tag,
             mock_server.uri(),
             slow_sha
         );
@@ -1104,7 +1252,17 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(
+            api_client,
+            blob_cache,
+            store,
+            cellar,
+            linker,
+            db,
+            tap_manager,
+            4,
+        );
 
         // Install slow package (which depends on fast)
         // With streaming, fast should be extracted while slow is still downloading
@@ -1135,6 +1293,7 @@ mod tests {
         let bottle_sha = sha256_hex(&bottle);
 
         // Create formula JSON
+        let tag = get_test_bottle_tag();
         let formula_json = format!(
             r#"{{
                 "name": "retrypkg",
@@ -1143,15 +1302,17 @@ mod tests {
                 "bottle": {{
                     "stable": {{
                         "files": {{
-                            "arm64_sonoma": {{
-                                "url": "{}/bottles/retrypkg-1.0.0.arm64_sonoma.bottle.tar.gz",
+                            "{}": {{
+                                "url": "{}/bottles/retrypkg-1.0.0.{}.bottle.tar.gz",
                                 "sha256": "{}"
                             }}
                         }}
                     }}
                 }}
             }}"#,
+            tag,
             mock_server.uri(),
+            tag,
             bottle_sha
         );
 
@@ -1170,7 +1331,10 @@ mod tests {
         // First request returns corrupted data (wrong content but matches sha for download)
         // This simulates CDN corruption where sha passes but tar is invalid
         Mock::given(method("GET"))
-            .and(path("/bottles/retrypkg-1.0.0.arm64_sonoma.bottle.tar.gz"))
+            .and(path(format!(
+                "/bottles/retrypkg-1.0.0.{}.bottle.tar.gz",
+                tag
+            )))
             .respond_with(move |_: &wiremock::Request| {
                 let attempt = attempt_clone.fetch_add(1, Ordering::SeqCst);
                 if attempt == 0 {
@@ -1202,7 +1366,8 @@ mod tests {
         let linker = Linker::new(&prefix).unwrap();
         let db = Database::open(&root.join("db/zb.sqlite3")).unwrap();
 
-        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, 4);
+        let tap_manager = TapManager::new(root.clone());
+        let mut installer = Installer::new(api_client, blob_cache, store, cellar, linker, db, tap_manager, 4);
 
         // Install - should succeed (first download is valid in this test)
         installer.install("retrypkg", true).await.unwrap();

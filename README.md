@@ -1,3 +1,12 @@
+<div align="center">
+
+# zerobrew
+
+[![Lint](https://github.com/lucasgelfond/zerobrew/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasgelfond/zerobrew/actions/workflows/ci.yml)
+[![Test](https://github.com/lucasgelfond/zerobrew/actions/workflows/test.yml/badge.svg)](https://github.com/lucasgelfond/zerobrew/actions/workflows/test.yml)
+
+</div>
+
 ## Install
 
 ```bash
@@ -8,7 +17,7 @@ After install, run the export command it prints, or restart your terminal.
 
 Join the [Discord](https://discord.gg/UxAAvZ93) for support / discussion.
 
-# zerobrew
+## About
 
 A faster, modern Mac package manager.
 
@@ -45,22 +54,34 @@ zb gc                # garbage collect unused store entries
 
 ## Notes on LLMs
 
-I spent a lot of time thinking through this architecture, testing, and debugging. I also used Claude Opus 4.5 to write much of the code here. I am a big believer in language models for coding, especialy when they are given a precise spec and work with human input! See some of the discussion about this [on Reddit](https://www.reddit.com/r/rust/comments/1qn2aev/zerobrew_is_a_rustbased_520x_faster_dropin/) that convinced me it was worth adding to the README. A lot of people I respect, [including the developers of uv](https://x.com/charliermarsh/status/2007117912801427905) are doing similar sorts of development, I don't think this is a particularly crazy practice in 2026. 
+I spent a lot of time thinking through this architecture, testing, and debugging. I also used Claude Opus 4.5 to write much of the code here. I am a big believer in language models for coding, especially when they are given a precise spec and work with human input! See some of the discussion about this [on Reddit](https://www.reddit.com/r/rust/comments/1qn2aev/zerobrew_is_a_rustbased_520x_faster_dropin/) that convinced me it was worth adding to the README. A lot of people I respect, [including the developers of uv](https://x.com/charliermarsh/status/2007117912801427905) are doing similar sorts of development, I don't think this is a particularly crazy practice in 2026. 
 
 
 ## Storage layout
 
-```
-/opt/zerobrew/
-├── store/          # content-addressable (sha256 keys)
-├── prefix/
-│   ├── Cellar/     # materialized packages
-│   ├── bin/        # symlinked executables
-│   └── opt/        # symlinked package directories
-├── cache/          # downloaded bottle blobs
+```sh
+/opt/zerobrew/      # Data directory (default: $ZEROBREW_ROOT)
+├── store/          # sha256-addressable packages
 ├── db/             # sqlite database
-└── locks/          # per-entry file locks
+├── cache/          # downloaded bottle blobs
+├── locks/          # per-entry file locks
+└── prefix/         # $ZEROBREW_PREFIX (default: $ZEROBREW_ROOT/prefix)
+    ├── bin/        # symlinked executables
+    ├── Cellar/     # materialized packages
+    ├── lib/
+    ├── include/
+    ├── share/
+    └── opt/        # symlinked package directories
+~/.zerobrew/        # $ZEROBREW_DIR (source code, default: ~/.zerobrew)
+~/.local/bin/zb     # $ZEROBREW_BIN (binary, default: ~/.local/bin)
 ```
+
+All variables are respected by both the install script and `zb` CLI:
+
+- `ZEROBREW_ROOT`
+- `ZEROBREW_PREFIX`
+- `ZEROBREW_DIR`
+- `ZEROBREW_BIN`
 
 ## Build from source 
 
@@ -83,3 +104,7 @@ cargo install --path zb_cli
 
 Experimental. works for most core homebrew packages. Some formulas may need more work - please submit issues / PRs! 
 
+
+## License
+
+zerobrew is dual-licensed, usable under both [Apache](./LICENSE-APACHE.md) and [MIT](./LICENSE-MIT.md)
