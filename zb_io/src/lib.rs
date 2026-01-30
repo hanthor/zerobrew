@@ -11,6 +11,7 @@ mod linux_patch;
 pub mod materialize;
 pub mod progress;
 pub mod store;
+pub mod tap;
 
 pub use api::ApiClient;
 pub use blob::BlobCache;
