@@ -7,6 +7,11 @@ pub struct ApiClient {
     cache: Option<ApiCache>,
 }
 
+enum EntryType {
+    Formula,
+    Cask,
+}
+
 impl ApiClient {
     pub fn new() -> Self {
         Self::with_base_url("https://formulae.brew.sh/api/formula".to_string())
@@ -106,16 +111,23 @@ impl ApiClient {
         Ok(formula)
     }
     pub async fn get_all_formula_names(&self) -> Result<Vec<String>, Error> {
-        self.fetch_names_from_list("https://formulae.brew.sh/api/formula.json")
-            .await
+        self.fetch_names_from_list(
+            "https://formulae.brew.sh/api/formula.json",
+            EntryType::Formula,
+        )
+        .await
     }
 
     pub async fn get_all_cask_names(&self) -> Result<Vec<String>, Error> {
-        self.fetch_names_from_list("https://formulae.brew.sh/api/cask.json")
+        self.fetch_names_from_list("https://formulae.brew.sh/api/cask.json", EntryType::Cask)
             .await
     }
 
-    async fn fetch_names_from_list(&self, url: &str) -> Result<Vec<String>, Error> {
+    async fn fetch_names_from_list(
+        &self,
+        url: &str,
+        entry_type: EntryType,
+    ) -> Result<Vec<String>, Error> {
         let cached_entry = self.cache.as_ref().and_then(|c| c.get(url));
         let mut request = self.client.get(url);
 
@@ -166,9 +178,19 @@ impl ApiClient {
 
         // Extract names
         #[derive(serde::Deserialize)]
+        struct BottleStable {
+            files: Option<std::collections::HashMap<String, serde_json::Value>>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Bottle {
+            stable: Option<BottleStable>,
+        }
+        #[derive(serde::Deserialize)]
         struct Item {
             name: Option<serde_json::Value>,
             token: Option<String>,
+            #[serde(default)]
+            bottle: Option<Bottle>,
         }
         let items: Vec<Item> = serde_json::from_str(&body).map_err(|e| Error::NetworkFailure {
             message: format!("failed to parse full list JSON: {e}"),
@@ -177,6 +199,33 @@ impl ApiClient {
         let names: Vec<String> = items
             .into_iter()
             .filter_map(|i| {
+                // OS-based filtering
+                if cfg!(target_os = "linux") {
+                    if matches!(entry_type, EntryType::Cask) {
+                        return None;
+                    }
+                    // Filter formulas: if bottle info exists, ensure it has linux support
+                    if matches!(entry_type, EntryType::Formula) {
+                        let bottle_files = i
+                            .bottle
+                            .as_ref()
+                            .and_then(|b| b.stable.as_ref())
+                            .and_then(|s| s.files.as_ref());
+
+                        if let Some(files) = bottle_files {
+                            let has_linux = files
+                                .keys()
+                                .any(|k| k.contains("linux") || k == "all" || k == "x86_64_linux");
+                            if !has_linux {
+                                return None;
+                            }
+                        }
+                    }
+                } else if cfg!(target_os = "macos") {
+                    // On macOS, we generally support everything, but could filter linux-only bottles if they existed
+                    // For now, accept all schemas on macOS
+                }
+
                 if let Some(token) = i.token {
                     Some(token)
                 } else if let Some(name_val) = i.name {
